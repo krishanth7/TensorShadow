@@ -1,0 +1,11 @@
+server:
+  port: 8080
+  env: "production"
+
+model:
+  path: "./tensorflow_model/saved_model"
+  threshold: 0.75
+
+analytics:
+  enabled: true
+  output_dir: "./data/reports"

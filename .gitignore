@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Go
+bin/
+go_backend/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# R
+.Rhistory
+.RData
+.Ruserdata
+*-Ex.R
+/*.tar.gz
+/*.Rcheck/
+.Rproj.user/
+vignettes/*.html
+vignettes/*.pdf
+.httr-oauth
+/*_cache/
+/cache/
+glass.png
+Rtmp*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data & Config
+data/*.csv
+data/*.json
+!data/sample_*.csv
+configs/*.local.yaml
+*.log
