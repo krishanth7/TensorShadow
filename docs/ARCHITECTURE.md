@@ -9,5 +9,6 @@
 ## Components
 - **Go Backend:** Built with Gin, provides a robust gateway.
 - **TensorFlow:** Utilizes a custom Dense Neural Network (DNN).
-- **R Scripts:** Uses `ggplot2` for high-fidelity performance visualizations.
+- **R Scripts:** Uses `ggplot2` for high-fidelity performance Visualisations.
+
 

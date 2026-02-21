@@ -11,7 +11,7 @@
 
 ## 💎 Key Features
 
-- **Tricolor Biometric Segmentation:**
+- **Tricolour Biometric Segmentation:**
   - 🟠 **Orange Matrix:** 468-point high-density facial topography.
   - 🔵 **Blue Ocular Points:** High-precision iris and pupil tracking.
   - 🟢 **Green Maxillary Scan:** Real-time dental and oral geometry analysis.
@@ -25,9 +25,9 @@
 ## 🏗️ Architecture
 
 - **Neural Engine:** MediaPipe Holistic + TensorFlow.js.
-- **Visualizer:** Three.js 3D Rendering + Canvas 2D Overlay.
+- **Visualiser:** Three.js 3D Rendering + Canvas 2D Overlay.
 - **Backend:** Flask-driven Simulation Server (Ready for Go/C++ migration).
-- **ML Pipe:** Scikit-Learn MLP fallback for localized "on-the-fly" training.
+- **ML Pipe:** Scikit-Learn MLP fallback for localised "on-the-fly" training.
 
 ---
 

@@ -40,7 +40,7 @@ def main():
     print("\n==========================================")
     print("  PIPELINE EXECUTION SUCCESSFUL")
     print("  Documentation: /docs")
-    print("  Visualizations: /docs/model_performance.png")
+    print("  Visualisations: /docs/model_performance.png")
     print("==========================================")
     
     # Stop the server
@@ -49,4 +49,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

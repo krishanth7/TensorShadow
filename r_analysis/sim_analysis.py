@@ -15,7 +15,7 @@ def run_analysis():
 
     epochs = range(1, len(stats['accuracy']) + 1)
     
-    # Generate high-quality visualization
+    # Generate high-quality Visualisation
     plt.figure(figsize=(10, 6))
     plt.plot(epochs, stats['accuracy'], marker='o', linestyle='-', color='#276DC3', label='Accuracy')
     plt.plot(epochs, stats['loss'], marker='x', linestyle='--', color='#FF6F00', label='Loss')
@@ -28,7 +28,7 @@ def run_analysis():
     
     os.makedirs("docs", exist_ok=True)
     plt.savefig("docs/model_performance.png")
-    print("Visualization saved to: docs/model_performance.png")
+    print("Visualisation saved to: docs/model_performance.png")
     
     # Export clean summary
     summary = {
@@ -43,4 +43,5 @@ def run_analysis():
 
 if __name__ == "__main__":
     run_analysis()
+
 

@@ -19,7 +19,7 @@ def build_model(input_shape: tuple, num_classes: int):
             layers.Dense(64, activation='relu'),
             layers.Dense(num_classes, activation='softmax')
         ])
-        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        model.compile(optimiser='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
         return model
     else:
         print("[Engine] TensorFlow not found. Falling back to Scikit-Learn MLP backend.")
@@ -33,3 +33,4 @@ if __name__ == "__main__":
         model.summary()
     else:
         print("Model architecture defined (Ready for Scikit-Learn fallback)")
+

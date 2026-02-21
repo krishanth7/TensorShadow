@@ -1,4 +1,4 @@
-# TensorShadow Analytics & Visualization Script
+# TensorShadow Analytics & Visualisation Script
 # Purpose: Statistical analysis of model performance and data trends.
 
 library(ggplot2)
@@ -46,4 +46,5 @@ stats_summary <- performance_data %>%
 write_json(stats_summary, "data/stats_summary.json", pretty = TRUE)
 
 print("Analysis complete. Reports saved to /docs and /data.")
+
 

@@ -9,3 +9,4 @@ model:
 analytics:
   enabled: true
   output_dir: "./data/reports"
+

@@ -32,10 +32,11 @@ def simulate_pipeline():
     print("2. [Go] Starting API Gateway...")
     print("   - Routes: /predict (POST), /health (GET), /stats (GET).")
     print("3. [R] Preparing Analytical Engine...")
-    print("   - Reporting: ggplot2 visualization active.")
+    print("   - Reporting: ggplot2 Visualisation active.")
     print("\n[SUCCESS] System architecture is valid and components are linked via /configs/config.yaml")
 
 if __name__ == "__main__":
     check_structure()
     simulate_pipeline()
+
 
