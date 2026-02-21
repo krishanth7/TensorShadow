@@ -1,4 +1,4 @@
-# TensorShadow Platinum 🛡️🧿
+# TensorShadow Platinum
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9+-3776AB?style=flat&logo=python)](https://www.python.org/)
