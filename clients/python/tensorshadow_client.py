@@ -69,6 +69,40 @@ class TensorShadowClient:
     def stats(self) -> Dict[str, Any]:
         return self._json("GET", "/api/v1/stats")
 
+    # -- model serving -------------------------------------------------------
+    def predict(self, features: Sequence[float]) -> Dict[str, Any]:
+        """Score one vector (TF Serving / ONNX Runtime / baseline, per server config)."""
+        return self._json("POST", "/api/v1/predict", {"data": list(features)})
+
+    def predict_batch(self, instances: Sequence[Sequence[float]]) -> Dict[str, Any]:
+        return self._json("POST", "/api/v1/predict", {"instances": [list(x) for x in instances]})
+
+    def model_info(self) -> Dict[str, Any]:
+        return self._json("GET", "/api/v1/model")
+
+    # -- visible/IR co-registration -----------------------------------------
+    def create_rig(self, rig_id: str, visible_size: Sequence[int], thermal_size: Sequence[int],
+                   points: List[Dict[str, Any]], **options: Any) -> Dict[str, Any]:
+        """Calibrate a rig from [{"visible": {"x":..,"y":..}, "thermal": {"x":..,"y":..}}, ...]."""
+        return self._json("POST", "/api/v1/coreg/rigs", {
+            "id": rig_id, "points": points,
+            "visible": {"width": visible_size[0], "height": visible_size[1]},
+            "thermal": {"width": thermal_size[0], "height": thermal_size[1]}, **options})
+
+    def delete_rig(self, rig_id: str) -> None:
+        self._request("DELETE", f"/api/v1/coreg/rigs/{urllib.parse.quote(rig_id)}")
+
+    def thermal_analyze_coregistered(self, buffer: bytes, width: int, height: int, rig: str,
+                                     visible_boxes: List[Dict[str, Any]], **params: Any) -> Dict[str, Any]:
+        """Analyse a raw uint16 frame using face boxes from the RGB camera.
+
+        ``visible_boxes`` are {"x","y","w","h"[, "id"]} in visible-camera pixels.
+        """
+        vbox = [",".join(str(b[k]) for k in ("x", "y", "w", "h")) + (f",{b['id']}" if b.get("id") else "")
+                for b in visible_boxes]
+        query = urllib.parse.urlencode({"width": width, "height": height, "rig": rig, "vbox": vbox, **params}, doseq=True)
+        return self._request("POST", "/api/v1/thermal/analyze?" + query, bytes(buffer), "application/octet-stream")
+
     # -- infrared thermal ----------------------------------------------------
     def thermal_analyze(self, temps_c: Sequence[float], width: int, height: int,
                         ambient_c: Optional[float] = None, **calibration: float) -> Dict[str, Any]:
@@ -144,6 +178,23 @@ if __name__ == "__main__":
     res = client.thermal_analyze_raw(frame.tobytes(), w, h, ambient_c=22)
     s = res["subjects"][0]
     print(f"thermal: canthus {s['canthus']['temp_c']} °C -> {s['status']}, live={s['liveness']['live']}")
+
+    model = client.model_info()
+    pred = client.predict([0.4, -0.2, 0.1, 0.3, -0.5, 0.2, 0.0, 0.6, -0.1, 0.3])
+    print(f"predict: backend={pred['backend']} class={pred['class']} p={pred['result']} "
+          f"(model ready={model['status']['ready']})")
+
+    # Co-registration: the thermal camera sees the visible scene at 1/10 scale.
+    pts = [{"visible": {"x": x, "y": y}, "thermal": {"x": x / 10, "y": y / 10}}
+           for x in (40, 320, 600) for y in (40, 240, 440)]
+    client.create_rig("py-rig", (640, 480), (w, h), pts)
+    try:
+        face = {"x": 220, "y": 120, "w": 200, "h": 240, "id": "rgb-1"}
+        res = client.thermal_analyze_coregistered(frame.tobytes(), w, h, "py-rig", [face], ambient_c=22)
+        s = res["subjects"][0]
+        print(f"coreg: RGB box {s['visible_roi']['id']} -> thermal ROI {s['roi']} -> {s['status']}")
+    finally:
+        client.delete_rig("py-rig")
 
     client.create_session("py-demo", 1280, 720,
                           lines=[{"id": "gate", "a": {"x": 640, "y": 0}, "b": {"x": 640, "y": 720}}])

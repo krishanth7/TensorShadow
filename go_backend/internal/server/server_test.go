@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/config"
+	"github.com/TensorShadow/TensorShadow/go_backend/internal/inference"
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/sim"
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/thermal"
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/tracking"
@@ -102,16 +103,91 @@ func TestPredictKeepsV1Contract(t *testing.T) {
 	ts := newTestServer(t, nil)
 	resp, body := do(t, "POST", ts.URL+"/api/v1/predict", map[string]any{"data": []float64{0, 0}})
 	var out struct {
-		Status string  `json:"status"`
-		Result float64 `json:"result"`
+		Status  string  `json:"status"`
+		Result  float64 `json:"result"`
+		Model   string  `json:"model"`
+		Backend string  `json:"backend"`
 	}
 	json.Unmarshal(body, &out)
-	if resp.StatusCode != 200 || out.Status != "success" || out.Result != 0.5 {
+	if resp.StatusCode != 200 || out.Status != "success" || out.Result != 0.5 || out.Model != "baseline-logistic" || out.Backend != "baseline" {
 		t.Fatalf("predict: %d %s", resp.StatusCode, body)
 	}
-	resp, _ = do(t, "POST", ts.URL+"/api/v1/predict", map[string]any{"data": []float64{}})
-	if resp.StatusCode != 400 {
-		t.Fatalf("empty data accepted: %d", resp.StatusCode)
+	for _, bad := range []map[string]any{{"data": []float64{}}, {}, {"data": []float64{1}, "instances": [][]float64{{1}}}} {
+		if resp, body := do(t, "POST", ts.URL+"/api/v1/predict", bad); resp.StatusCode != 400 {
+			t.Fatalf("%v accepted: %d %s", bad, resp.StatusCode, body)
+		}
+	}
+	_, body = do(t, "GET", ts.URL+"/api/v1/model", nil)
+	if !strings.Contains(string(body), `"ready":true`) {
+		t.Fatalf("model info: %s", body)
+	}
+}
+
+// TestPredictThroughModelServers wires the endpoint to protocol-faithful TF
+// Serving and Open Inference Protocol servers, then to a dead backend.
+func TestPredictThroughModelServers(t *testing.T) {
+	tfs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models/tensorshadow:predict" {
+			w.Write([]byte(`{"predictions": [[0.2, 0.8], [0.9, 0.1]]}`))
+			return
+		}
+		w.Write([]byte(`{"model_version_status":[{"version":"1","state":"AVAILABLE","status":{"error_code":"OK"}}]}`))
+	}))
+	defer tfs.Close()
+	v2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/models/tensorshadow":
+			w.Write([]byte(`{"name":"tensorshadow","versions":["1"],"platform":"onnxruntime_onnx","inputs":[{"name":"features","datatype":"FP32","shape":[-1,2]}]}`))
+		case "/v2/models/tensorshadow/infer":
+			w.Write([]byte(`{"model_name":"tensorshadow","model_version":"1","outputs":[{"name":"probabilities","datatype":"FP32","shape":[1,2],"data":[0.3,0.7]}]}`))
+		case "/v2/models/tensorshadow/ready":
+			w.Write([]byte(`{"ready":true}`))
+		}
+	}))
+	defer v2.Close()
+
+	serve := func(backend, url string, fallback bool) *httptest.Server {
+		icfg := inference.DefaultConfig()
+		icfg.Backend, icfg.URL, icfg.Fallback, icfg.Retries = backend, url, fallback, 0
+		eng, err := inference.New(icfg, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := config.Default()
+		pool := workerpool.New(1, 1)
+		t.Cleanup(func() { pool.Shutdown(context.Background()) })
+		srv := httptest.NewServer(New(cfg, Deps{Pool: pool, Crowd: tracking.NewManager(cfg.Tracking), Infer: eng}).Handler())
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	ts := serve(inference.BackendTFServing, tfs.URL, true)
+	_, body := do(t, "POST", ts.URL+"/api/v1/predict", map[string]any{"instances": [][]float64{{1, 2}, {3, 4}}})
+	if !strings.Contains(string(body), `"predictions":[{"outputs":[0.2,0.8],"result":0.8,"class":1},{"outputs":[0.9,0.1],"result":0.9,"class":0}]`) ||
+		!strings.Contains(string(body), `"backend":"tfserving"`) {
+		t.Fatalf("tfserving batch: %s", body)
+	}
+
+	ts = serve(inference.BackendONNXRuntime, v2.URL, true)
+	_, body = do(t, "POST", ts.URL+"/api/v1/predict", map[string]any{"data": []float64{1, 2}})
+	if !strings.Contains(string(body), `"result":0.7,"class":1`) || !strings.Contains(string(body), `"backend":"onnxruntime","model":"tensorshadow","version":"1"`) {
+		t.Fatalf("onnxruntime single: %s", body)
+	}
+	_, body = do(t, "GET", ts.URL+"/api/v1/model", nil)
+	if !strings.Contains(string(body), `"platform":"onnxruntime_onnx"`) {
+		t.Fatalf("model info: %s", body)
+	}
+
+	// Dead backend: degraded answer with fallback, 503 without.
+	ts = serve(inference.BackendONNXRuntime, "http://127.0.0.1:1", true)
+	_, body = do(t, "POST", ts.URL+"/api/v1/predict", map[string]any{"data": []float64{0, 0}})
+	if !strings.Contains(string(body), `"degraded":true`) || !strings.Contains(string(body), `"backend":"baseline"`) {
+		t.Fatalf("fallback: %s", body)
+	}
+	ts = serve(inference.BackendONNXRuntime, "http://127.0.0.1:1", false)
+	resp, body := do(t, "POST", ts.URL+"/api/v1/predict", map[string]any{"data": []float64{0, 0}})
+	if resp.StatusCode != 503 || !strings.Contains(string(body), "model_unavailable") {
+		t.Fatalf("no fallback: %d %s", resp.StatusCode, body)
 	}
 }
 
@@ -312,7 +388,8 @@ func TestBackpressureReturns503(t *testing.T) {
 	}()
 	<-busy
 
-	resp, body := do(t, "POST", ts.URL+"/api/v1/predict", map[string]any{"data": []float64{1}})
+	tiny := map[string]any{"width": 1, "height": 1, "data": []float64{30}}
+	resp, body := do(t, "POST", ts.URL+"/api/v1/thermal/analyze", tiny)
 	if resp.StatusCode != 503 || resp.Header.Get("Retry-After") != "1" || !strings.Contains(string(body), "overloaded") {
 		t.Fatalf("saturated pool: %d %s", resp.StatusCode, body)
 	}
@@ -320,7 +397,7 @@ func TestBackpressureReturns503(t *testing.T) {
 	// Once the worker frees up, requests succeed again.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		resp, _ = do(t, "POST", ts.URL+"/api/v1/predict", map[string]any{"data": []float64{1}})
+		resp, _ = do(t, "POST", ts.URL+"/api/v1/thermal/analyze", tiny)
 		if resp.StatusCode == 200 || time.Now().After(deadline) {
 			break
 		}
@@ -387,5 +464,111 @@ func TestThermalBinaryIngest(t *testing.T) {
 		if resp.StatusCode != 400 {
 			t.Errorf("%s (%d bytes): status %d, want 400", bad.query, len(bad.body), resp.StatusCode)
 		}
+	}
+}
+
+// TestCoregistrationDrivesThermalROIs calibrates a visible/IR rig through the
+// API, then analyses the thermal frame using only RGB face boxes.
+func TestCoregistrationDrivesThermalROIs(t *testing.T) {
+	ts := newTestServer(t, nil)
+	scene := sim.DemoCoregScene()
+	resp, body := do(t, "POST", ts.URL+"/api/v1/coreg/rigs", map[string]any{
+		"id": "gate-1", "visible": map[string]int{"width": 1280, "height": 960},
+		"thermal": map[string]int{"width": 160, "height": 120}, "points": scene.Calibration,
+	})
+	if resp.StatusCode != 201 || !strings.Contains(string(body), `"quality":"good"`) {
+		t.Fatalf("create rig: %d %s", resp.StatusCode, body)
+	}
+
+	frame := demoFrame()
+	frame.Rig = "gate-1"
+	frame.VisibleROIs = append(scene.FaceBoxes, thermal.VisibleBox{X: 5000, Y: 5000, W: 50, H: 50, ID: "off-frame"})
+	resp, body = do(t, "POST", ts.URL+"/api/v1/thermal/analyze", frame)
+	var res thermalResponse
+	json.Unmarshal(body, &res)
+	if resp.StatusCode != 200 || len(res.Subjects) != 4 {
+		t.Fatalf("analyze: %d %s", resp.StatusCode, body)
+	}
+	want := []string{thermal.StatusNormal, thermal.StatusElevated, thermal.StatusFever}
+	for i, s := range res.Subjects {
+		if s.VisibleROI == nil || s.VisibleROI.ID != scene.FaceBoxes[i].ID {
+			t.Fatalf("subject %d not linked to its RGB box: %+v", i, s.VisibleROI)
+		}
+		if i < 3 && (s.Status != want[i] || !s.Liveness.Live) {
+			t.Errorf("subject %d: %s live=%v", i, s.Status, s.Liveness.Live)
+		}
+	}
+	if res.Subjects[3].Liveness.Live {
+		t.Error("spoof passed liveness through co-registered ROI")
+	}
+	if res.Coregistration == nil || res.Coregistration.Mapped != 4 || len(res.Coregistration.OutsideFrame) != 1 {
+		t.Fatalf("coregistration info %+v", res.Coregistration)
+	}
+
+	// Binary upload with vbox query parameters.
+	buf := make([]byte, 2*len(frame.Data))
+	for i, c := range frame.Data {
+		binary.LittleEndian.PutUint16(buf[2*i:], uint16(math.Round((c+273.15)*100)))
+	}
+	b := scene.FaceBoxes[2]
+	url := fmt.Sprintf("%s/api/v1/thermal/analyze?width=160&height=120&ambient_c=22&rig=gate-1&vbox=%g,%g,%g,%g,%s",
+		ts.URL, b.X, b.Y, b.W, b.H, b.ID)
+	bresp, err := http.Post(url, "application/octet-stream", bytes.NewReader(buf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bbody, _ := io.ReadAll(bresp.Body)
+	bresp.Body.Close()
+	if !strings.Contains(string(bbody), `"status":"fever"`) || !strings.Contains(string(bbody), `"id":"rgb-face-3"`) {
+		t.Fatalf("binary vbox: %s", bbody)
+	}
+
+	_, body = do(t, "POST", ts.URL+"/api/v1/coreg/rigs/gate-1/map", map[string]any{"boxes": scene.FaceBoxes[:1]})
+	if !strings.Contains(string(body), `"thermal":{"x":`) {
+		t.Fatalf("map: %s", body)
+	}
+
+	for _, c := range []struct {
+		mut  func(*thermal.FrameRequest)
+		code int
+	}{
+		{func(f *thermal.FrameRequest) { f.Rig = "nope" }, 404},
+		{func(f *thermal.FrameRequest) { f.Rig = "" }, 400},
+		{func(f *thermal.FrameRequest) { f.ROIs = []thermal.Rect{{X: 1, Y: 1, W: 5, H: 5}} }, 400},
+		{func(f *thermal.FrameRequest) {
+			f.Width, f.Height, f.Data = 80, 60, make([]float64, 4800)
+		}, 400},
+	} {
+		f := demoFrame()
+		f.Rig, f.VisibleROIs = "gate-1", scene.FaceBoxes
+		c.mut(&f)
+		if resp, body := do(t, "POST", ts.URL+"/api/v1/thermal/analyze", f); resp.StatusCode != c.code {
+			t.Errorf("want %d, got %d %s", c.code, resp.StatusCode, body)
+		}
+	}
+	if resp, _ := do(t, "DELETE", ts.URL+"/api/v1/coreg/rigs/gate-1", nil); resp.StatusCode != 204 {
+		t.Fatalf("delete rig: %d", resp.StatusCode)
+	}
+}
+
+// TestReIDThroughAPI sends embeddings over HTTP and checks recovery after an
+// occlusion longer than max_age.
+func TestReIDThroughAPI(t *testing.T) {
+	ts := newTestServer(t, nil)
+	scene := sim.OccludedCrowdScene()
+	seq := scene.Generate()
+	do(t, "POST", ts.URL+"/api/v1/crowd/sessions", tracking.SessionConfig{
+		ID: "pillar", FrameWidth: scene.Width, FrameHeight: scene.Height,
+		Lines: []tracking.Tripwire{{ID: "mid", A: tracking.Point{X: 640, Y: 0}, B: tracking.Point{X: 640, Y: 720}}},
+	})
+	var last tracking.FrameResult
+	for _, dets := range seq.Frames {
+		_, body := do(t, "POST", ts.URL+"/api/v1/crowd/sessions/pillar/frames", tracking.FrameInput{Detections: dets})
+		json.Unmarshal(body, &last)
+	}
+	a := last.Analytics
+	observable := seq.Truth.LeftToRight + seq.Truth.RightToLeft - seq.Truth.HiddenCrossings
+	if !a.ReID.Enabled || a.ReID.EmbeddingDim != 128 || int(a.Lines[0].In+a.Lines[0].Out) != observable || a.ReID.Recoveries == 0 {
+		t.Fatalf("reid over API: %+v lines=%+v observable=%d", a.ReID, a.Lines, observable)
 	}
 }

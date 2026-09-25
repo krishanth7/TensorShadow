@@ -25,6 +25,7 @@ import (
 //	gain, offset    raw16 calibration: T°C = gain·raw + offset
 //	emissivity, reflected_temp_c, ambient_c
 //	roi             x,y,w,h — may be repeated
+//	rig, vbox       co-registration rig and visible-camera boxes x,y,w,h[,id]
 func (s *Server) readFrame(w http.ResponseWriter, r *http.Request) (thermal.FrameRequest, bool) {
 	var req thermal.FrameRequest
 	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -81,6 +82,26 @@ func (s *Server) parseBinaryFrame(r *http.Request, req *thermal.FrameRequest) er
 	}
 	if err != nil {
 		return err
+	}
+	req.Rig = q.Get("rig")
+	for _, vb := range q["vbox"] {
+		parts := strings.Split(vb, ",")
+		if len(parts) != 4 && len(parts) != 5 {
+			return fmt.Errorf("vbox %q must be x,y,w,h or x,y,w,h,id", vb)
+		}
+		var v [4]float64
+		for i := 0; i < 4; i++ {
+			f, e := strconv.ParseFloat(strings.TrimSpace(parts[i]), 64)
+			if e != nil {
+				return fmt.Errorf("vbox %q must contain numbers", vb)
+			}
+			v[i] = f
+		}
+		box := thermal.VisibleBox{X: v[0], Y: v[1], W: v[2], H: v[3]}
+		if len(parts) == 5 {
+			box.ID = strings.TrimSpace(parts[4])
+		}
+		req.VisibleROIs = append(req.VisibleROIs, box)
 	}
 	for _, roi := range q["roi"] {
 		parts := strings.Split(roi, ",")

@@ -37,7 +37,7 @@ func main() {
 	addr := flag.String("addr", "http://localhost:8080", "backend base URL")
 	conc := flag.Int("c", 32, "concurrent clients (one camera stream each)")
 	dur := flag.Duration("d", 10*time.Second, "test duration")
-	scenario := flag.String("scenario", "crowd", "crowd | thermal | mixed")
+	scenario := flag.String("scenario", "crowd", "crowd | thermal | mixed | predict")
 	encoding := flag.String("thermal-encoding", "binary", "thermal frame encoding: binary (uint16 centikelvin) | json")
 	flag.Parse()
 	base := strings.TrimRight(*addr, "/")
@@ -66,6 +66,16 @@ func main() {
 	} else {
 		thermalBody, _ = json.Marshal(thermal.FrameRequest{Width: scene.Width, Height: scene.Height,
 			Data: temps, AmbientTempC: &amb})
+	}
+
+	// Ten-feature vectors for the exported TensorShadow model.
+	predictBodies := make([][]byte, 64)
+	for i := range predictBodies {
+		v := make([]float64, 10)
+		for j := range v {
+			v[j] = math.Sin(float64(i*10+j)) * 1.5
+		}
+		predictBodies[i], _ = json.Marshal(map[string]any{"data": v})
 	}
 
 	fmt.Printf("tsload: %d clients, %s, scenario=%s, target=%s\n", *conc, *dur, *scenario, base)
@@ -103,7 +113,10 @@ func main() {
 			local := make([]sample, 0, 4096)
 			for i := 0; time.Now().Before(deadline); i++ {
 				url, kind, ctype, body := base+"/api/v1/crowd/sessions/"+sid+"/frames", "crowd", "application/json", frames[i%len(frames)]
-				if !useCrowd {
+				switch {
+				case *scenario == "predict":
+					url, kind, body = base+"/api/v1/predict", "predict", predictBodies[i%len(predictBodies)]
+				case !useCrowd:
 					url, kind, ctype, body = thermalURL, "thermal", thermalType, thermalBody
 				}
 				st, lat, err := post(client, url, ctype, body)

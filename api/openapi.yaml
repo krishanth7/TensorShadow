@@ -1,10 +1,12 @@
 openapi: 3.0.3
 info:
   title: TensorShadow API
-  version: 2.0.0
+  version: 2.1.0
   description: |
-    High-concurrency biometric intelligence API: infrared (IR) thermal
-    screening, multi-subject tracking and crowd analytics.
+    High-concurrency biometric intelligence API: model inference (TensorFlow
+    Serving / ONNX Runtime), infrared (IR) thermal screening with visible/IR
+    co-registration, and multi-subject tracking with appearance
+    re-identification and crowd analytics.
 
     CPU-bound work runs on a bounded worker pool. When the pool is saturated
     the API sheds load with `503 overloaded` + `Retry-After`; per-client rate
@@ -19,7 +21,11 @@ tags:
   - name: Thermal
     description: Infrared radiometric analysis
   - name: Crowd
-    description: Multi-subject tracking and crowd analytics
+    description: Multi-subject tracking, re-identification and crowd analytics
+  - name: Inference
+    description: Model serving (TensorFlow Serving, ONNX Runtime via Open Inference Protocol v2)
+  - name: Coregistration
+    description: Visible/IR camera calibration that drives thermal ROIs from an RGB face detector
 
 paths:
   /api/v1/health:
@@ -62,31 +68,90 @@ paths:
 
   /api/v1/predict:
     post:
-      tags: [System]
-      summary: Score a feature vector (v1 compatibility; baseline logistic model)
+      tags: [Inference]
+      summary: Score feature vectors on the configured model backend
+      description: |
+        Routes to TensorFlow Serving (`inference.backend: tfserving`), an
+        ONNX Runtime model behind the Open Inference Protocol v2
+        (`onnxruntime`: Triton, KServe or `tensorflow_model/onnx_server.py`),
+        or the in-process baseline. Remote calls have timeouts, retries and a
+        circuit breaker; with `inference.fallback` the baseline answers during
+        an outage and the response is marked `degraded`.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [data]
+              description: Exactly one of data (v1, single vector) or instances (batch).
               properties:
                 data: { type: array, items: { type: number }, minItems: 1, maxItems: 4096 }
+                instances:
+                  type: array
+                  maxItems: 256
+                  items: { type: array, items: { type: number } }
       responses:
         '200':
-          description: Prediction
+          description: Prediction(s)
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   status: { type: string, example: success }
-                  result: { type: number }
-                  model: { type: string, example: baseline-logistic }
+                  result: { type: number, description: Top output value (single requests) }
+                  class: { type: integer, description: Index of the top output (single requests) }
+                  outputs: { type: array, items: { type: number }, description: Full output vector (single requests) }
+                  predictions: { type: array, items: { $ref: '#/components/schemas/Prediction' }, description: Batch requests }
+                  backend: { type: string, enum: [baseline, tfserving, onnxruntime] }
+                  model: { type: string }
+                  version: { type: string }
+                  latency_ms: { type: number }
+                  degraded: { type: boolean }
+                  degraded_reason: { type: string }
                   timestamp: { type: string, format: date-time }
+                  request_id: { type: string }
         '400': { $ref: '#/components/responses/BadRequest' }
         '503': { $ref: '#/components/responses/Overloaded' }
+        '504': { $ref: '#/components/responses/Error' }
+
+  /api/v1/model:
+    get:
+      tags: [Inference]
+      summary: Model backend configuration, readiness and counters
+      responses:
+        '200':
+          description: Model info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  backend: { type: string }
+                  url: { type: string }
+                  model: { type: string }
+                  version: { type: string }
+                  input_dim: { type: integer }
+                  fallback: { type: boolean }
+                  status:
+                    type: object
+                    properties:
+                      ready: { type: boolean }
+                      state: { type: string, example: AVAILABLE }
+                      detail: { type: string }
+                      versions: { type: array, items: { type: string } }
+                      metadata: { type: object, additionalProperties: true }
+                  stats:
+                    type: object
+                    properties:
+                      requests: { type: integer }
+                      instances: { type: integer }
+                      backend_failures: { type: integer }
+                      retries: { type: integer }
+                      fallbacks: { type: integer }
+                      rejected_busy: { type: integer }
+                      breaker_open: { type: boolean }
+                      avg_backend_latency_ms: { type: number }
 
   /api/v1/thermal/analyze:
     post:
@@ -104,6 +169,8 @@ paths:
         - $ref: '#/components/parameters/AmbientC'
         - $ref: '#/components/parameters/Emissivity'
         - $ref: '#/components/parameters/ROI'
+        - $ref: '#/components/parameters/Rig'
+        - $ref: '#/components/parameters/VBox'
       requestBody:
         required: true
         content:
@@ -136,6 +203,8 @@ paths:
         - $ref: '#/components/parameters/Height'
         - $ref: '#/components/parameters/DType'
         - $ref: '#/components/parameters/Format'
+        - $ref: '#/components/parameters/Rig'
+        - $ref: '#/components/parameters/VBox'
       requestBody:
         required: true
         content:
@@ -164,6 +233,88 @@ paths:
                 properties:
                   palettes: { type: array, items: { type: string } }
                   default: { type: string }
+
+  /api/v1/coreg/rigs:
+    post:
+      tags: [Coregistration]
+      summary: Calibrate a visible/IR rig from point correspondences (or a known homography)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RigConfig' }
+      responses:
+        '201':
+          description: Calibrated rig with reprojection error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Rig' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Error' }
+    get:
+      tags: [Coregistration]
+      summary: List rigs
+      responses:
+        '200':
+          description: Rigs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  rigs: { type: array, items: { $ref: '#/components/schemas/Rig' } }
+
+  /api/v1/coreg/rigs/{id}:
+    parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+    get:
+      tags: [Coregistration]
+      summary: Describe a rig
+      responses:
+        '200':
+          description: Rig
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Rig' }
+        '404': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Coregistration]
+      summary: Delete a rig
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/v1/coreg/rigs/{id}/map:
+    parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+    post:
+      tags: [Coregistration]
+      summary: Map visible-camera boxes into thermal pixels
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [boxes]
+              properties:
+                boxes: { type: array, maxItems: 256, items: { $ref: '#/components/schemas/VisibleBox' } }
+      responses:
+        '200':
+          description: Mapped boxes (thermal is null when outside the thermal view)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rig: { type: string }
+                  boxes:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        visible: { $ref: '#/components/schemas/VisibleBox' }
+                        thermal: { allOf: [ { $ref: '#/components/schemas/Rect' } ], nullable: true }
+        '404': { $ref: '#/components/responses/Error' }
 
   /api/v1/crowd/sessions:
     post:
@@ -313,6 +464,8 @@ components:
     AmbientC: { name: ambient_c, in: query, schema: { type: number }, description: Binary uploads only — ambient air temperature (°C) }
     Emissivity: { name: emissivity, in: query, schema: { type: number, minimum: 0, maximum: 1 }, description: Binary uploads only }
     ROI: { name: roi, in: query, schema: { type: string, example: '12,20,30,38' }, description: 'Binary uploads only — x,y,w,h face box; repeatable' }
+    Rig: { name: rig, in: query, schema: { type: string }, description: Binary uploads only — co-registration rig ID }
+    VBox: { name: vbox, in: query, schema: { type: string, example: '712,160,236,301,track-17' }, description: 'Binary uploads only — visible-camera box x,y,w,h[,id]; repeatable; requires rig' }
 
   responses:
     Error:
@@ -361,6 +514,62 @@ components:
             message: { type: string }
         request_id: { type: string }
 
+    Prediction:
+      type: object
+      properties:
+        outputs: { type: array, items: { type: number } }
+        result: { type: number }
+        class: { type: integer }
+
+    VisibleBox:
+      type: object
+      required: [x, y, w, h]
+      properties:
+        x: { type: number }
+        y: { type: number }
+        w: { type: number }
+        h: { type: number }
+        id: { type: string, description: Caller's ID (e.g. RGB track ID), echoed on the thermal subject }
+
+    CoregPoint:
+      type: object
+      properties: { x: { type: number }, y: { type: number } }
+
+    RigConfig:
+      type: object
+      required: [id, visible, thermal]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        visible: { type: object, properties: { width: { type: integer }, height: { type: integer } } }
+        thermal: { type: object, properties: { width: { type: integer }, height: { type: integer } } }
+        model: { type: string, enum: [homography, affine], default: homography }
+        margin: { type: number, default: 0.1, description: ROI enlargement per side to absorb parallax }
+        points:
+          type: array
+          description: ≥ 4 (homography) or ≥ 3 (affine) correspondences, e.g. heated calibration-target corners
+          items:
+            type: object
+            properties:
+              visible: { $ref: '#/components/schemas/CoregPoint' }
+              thermal: { $ref: '#/components/schemas/CoregPoint' }
+        homography: { type: array, minItems: 9, maxItems: 9, items: { type: number }, description: Known row-major 3×3 matrix instead of points }
+
+    Rig:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        visible: { type: object, properties: { width: { type: integer }, height: { type: integer } } }
+        thermal: { type: object, properties: { width: { type: integer }, height: { type: integer } } }
+        model: { type: string }
+        homography: { type: array, items: { type: number } }
+        margin: { type: number }
+        points: { type: integer }
+        rmse_px: { type: number }
+        max_error_px: { type: number }
+        quality: { type: string, enum: [good, fair, poor, provided] }
+
     Rect:
       type: object
       properties: { x: { type: integer }, y: { type: integer }, w: { type: integer }, h: { type: integer } }
@@ -375,6 +584,8 @@ components:
         data: { type: array, items: { type: number }, description: Row-major apparent temperatures / counts }
         ambient_temp_c: { type: number }
         rois: { type: array, items: { $ref: '#/components/schemas/Rect' } }
+        rig: { type: string, description: Co-registration rig; requires visible_rois; excludes rois }
+        visible_rois: { type: array, maxItems: 64, items: { $ref: '#/components/schemas/VisibleBox' } }
         calibration:
           type: object
           properties:
@@ -387,6 +598,8 @@ components:
       type: object
       properties:
         index: { type: integer }
+        roi_index: { type: integer, description: Index into rois / visible_rois }
+        visible_roi: { $ref: '#/components/schemas/VisibleBox' }
         roi: { $ref: '#/components/schemas/Rect' }
         skin:
           type: object
@@ -435,6 +648,13 @@ components:
             reflected_c: { type: number }
         subjects: { type: array, items: { $ref: '#/components/schemas/ThermalSubject' } }
         summary: { type: object, additionalProperties: { type: integer } }
+        coregistration:
+          type: object
+          properties:
+            rig: { type: string }
+            calibration_quality: { type: string }
+            mapped: { type: integer }
+            outside_frame: { type: array, items: { type: integer } }
         processing_ms: { type: number }
         request_id: { type: string }
 
@@ -458,6 +678,7 @@ components:
         area_m2: { type: number, description: Ground area in view; enables persons/m² density }
         heatmap_cols: { type: integer, default: 32 }
         heatmap_rows: { type: integer, description: Defaults to the frame aspect ratio }
+        appearance_threshold: { type: number, description: Per-session override of tracking.appearance_threshold (max cosine distance) }
         lines:
           type: array
           maxItems: 32
@@ -506,6 +727,12 @@ components:
               bbox: { $ref: '#/components/schemas/BBox' }
               score: { type: number, description: 'Detector confidence; omitted = 1.0' }
               label: { type: string }
+              embedding:
+                type: array
+                maxItems: 2048
+                items: { type: number }
+                description: Optional appearance embedding (e.g. OSNet / ArcFace); enables re-identification after long occlusions
+
 
     Track:
       type: object
@@ -520,6 +747,7 @@ components:
         dwell_seconds: { type: number }
         score: { type: number }
         label: { type: string }
+        reidentified: { type: integer, description: Times this identity was recovered by appearance after > max_age frames unseen }
 
     Analytics:
       type: object
@@ -529,6 +757,13 @@ components:
         peak_subjects: { type: integer }
         peak_at: { type: string, format: date-time }
         frames_processed: { type: integer }
+        reid:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            embedding_dim: { type: integer }
+            appearance_threshold: { type: number }
+            recoveries: { type: integer }
         density:
           type: object
           properties:

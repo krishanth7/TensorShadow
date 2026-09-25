@@ -1,7 +1,8 @@
 # TensorShadow runtime configuration.
 # Every key is optional; omitted keys fall back to the defaults compiled into
 # go_backend/internal/config. Environment variables (TS_PORT, TS_ENV,
-# TS_WORKERS, TS_QUEUE_SIZE, TS_RATE_LIMIT_RPS) override the values below.
+# TS_WORKERS, TS_QUEUE_SIZE, TS_RATE_LIMIT_RPS, TS_INFERENCE_BACKEND,
+# TS_INFERENCE_URL) override the values below.
 
 server:
   port: 8080
@@ -45,6 +46,46 @@ tracking:
   session_ttl: 10m
   process_noise: 1.0
   measurement_noise: 4.0
+  # DeepSORT-style appearance re-identification (used when detections carry
+  # an "embedding"): tracks with appearance survive reid_max_age frames unseen.
+  reid_max_age: 90
+  appearance_threshold: 0.25 # max cosine distance for an appearance match
+  feature_budget: 16         # embeddings kept per track
+  gate_chi2: 9.21            # Mahalanobis motion gate (χ², 2 dof, 99 %)
+
+inference:
+  # baseline    — in-process logistic scorer (no model server needed)
+  # tfserving   — TensorFlow Serving REST, e.g. http://localhost:8501
+  # onnxruntime — Open Inference Protocol v2 (tensorflow_model/onnx_server.py,
+  #               Triton onnxruntime backend, KServe), e.g. http://localhost:8001
+  backend: baseline
+  url: ""
+  model: tensorshadow
+  version: ""                # empty = latest
+  input_name: ""             # v2 only; discovered from model metadata when empty
+  output_name: ""
+  input_dim: 10              # reject vectors of the wrong length up front (0 = off)
+  max_batch: 256
+  timeout: 2s
+  retries: 1
+  max_concurrent: 64
+  fallback: true             # answer from the baseline (marked degraded) during outages
+  breaker_threshold: 5       # consecutive failures that open the circuit breaker
+  breaker_cooldown: 10s
+
+coregistration:
+  # Visible/IR camera rigs preloaded at start-up (rigs can also be created at
+  # runtime via POST /api/v1/coreg/rigs). Example:
+  # rigs:
+  #   - id: entrance-gate-1
+  #     visible: { width: 1280, height: 960 }
+  #     thermal: { width: 160, height: 120 }
+  #     model: homography      # or affine (≥ 3 points)
+  #     margin: 0.1
+  #     points:                # heated calibration-target corners seen by both cameras
+  #       - { visible: { x: 200, y: 150 }, thermal: { x: 29.6, y: 17.4 } }
+  #       - ...
+  rigs: []
 
 model:
   path: "./tensorflow_model/saved_model"

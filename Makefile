@@ -4,7 +4,7 @@ BIN       := bin
 ADDR      ?= http://localhost:8080
 PKGS      := ./...
 
-.PHONY: help build run test race cover bench lint demo load docker smoke clean
+.PHONY: help build run test race cover bench lint demo load docker smoke clean models serve-onnx serve-tf live-test
 
 help: ## Show this help
 	@grep -E '^[a-z]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  \033[36m%-8s\033[0m %s\n", $$1, $$2}'
@@ -45,3 +45,17 @@ smoke: ## Repository structure check
 
 clean: ## Remove build output
 	rm -rf $(BIN)
+
+models: ## Train and export the SavedModel + ONNX model (needs tensorflow, onnx, onnxruntime)
+	python3 tensorflow_model/export_models.py
+
+serve-onnx: ## ONNX Runtime model server (Open Inference Protocol v2) on :8001
+	python3 tensorflow_model/onnx_server.py --port 8001
+
+serve-tf: ## TensorFlow Serving (Docker) on :8501
+	docker run --rm -p 8501:8501 -v $(CURDIR)/tensorflow_model/serving/tensorshadow:/models/tensorshadow \
+		-e MODEL_NAME=tensorshadow tensorflow/serving
+
+live-test: ## Parity test against running TF Serving (:8501) and ONNX Runtime (:8001)
+	TS_TFSERVING_URL=http://localhost:8501 TS_ONNX_URL=http://localhost:8001 \
+		$(GO) test -count=1 -run TestLiveModelServers -v ./go_backend/internal/inference/

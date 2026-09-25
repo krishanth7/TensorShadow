@@ -1,8 +1,8 @@
 # TensorShadow Architecture
 
 TensorShadow has a browser vision front end (MediaPipe + Three.js), a Go
-backend for high-concurrency processing, and Python/R tooling for model
-training and offline analysis.
+backend for high-concurrency processing, model servers (TensorFlow Serving and
+ONNX Runtime), and Python/R tooling for model training and offline analysis.
 
 ```text
  ┌──────────────── Browser dashboard (go_backend/web/index.html) ────────────────┐
@@ -22,13 +22,16 @@ training and offline analysis.
  │            │ queue full → 503 + Retry-After   · job timeout → 504 │               │
  │            └───────┬─────────────────────────────────┬───────────┘               │
  │                    ▼                                 ▼                           │
- │  internal/thermal                      internal/tracking                         │
- │  decode → ε-correction → segment       Manager (RWMutex, TTL eviction)           │
- │  → canthus → screen → liveness         └─ Session per camera (own mutex)         │
- │  → false-colour PNG                        Kalman predict → gated Hungarian      │
+ │  internal/thermal (+ internal/coreg)   internal/tracking                         │
+ │  rig: RGB boxes → homography → ROIs    Manager (RWMutex, TTL eviction)           │
+ │  decode → ε-correction → segment       └─ Session per camera (own mutex)         │
+ │  → canthus → screen → liveness            Kalman predict → appearance cascade    │
+ │  → false-colour PNG                        (ReID) → gated IoU Hungarian          │
  │                                            → lifecycle → tripwires, zones,       │
  │                                            density, flow, dwell, heatmap → SSE   │
  │                                                                                  │
+ │  internal/inference: /predict ─► TF Serving | ONNX Runtime (OIP v2) | baseline   │
+ │   timeouts · retries · circuit breaker · bulkhead · degraded fallback            │
  │  /metrics (Prometheus) · /api/v1/stats · graceful shutdown (SIGTERM drains)      │
  └──────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -85,11 +88,51 @@ The Go binary embeds the dashboard, and the Flask prototype serves the same file
 ## 5. Verification
 
 - Unit and end-to-end HTTP tests run under `-race` in CI (`.github/workflows/ci.yml`).
-- Accuracy gate: 50 randomised synthetic scenes, checked against ground truth for tripwire counts and identities.
+- Accuracy gates: 50 randomised synthetic scenes, checked against ground truth for tripwire counts and identities; a further 50 occluded scenes compare re-identification against pure IoU tracking.
+- A live parity test (`TestLiveModelServers`, a CI job) runs the Go client against real TF Serving and ONNX Runtime serving the same weights.
 - `api/openapi.yaml` is kept in sync with the router by `TestOpenAPICoversAllRoutes`.
 - `tsdemo` (feature walkthrough) and `tsload` (closed-loop load generator) run against a live server.
 
+## 6. Model serving (`internal/inference`, `tensorflow_model/`)
+
+```text
+ POST /api/v1/predict ─► validate (dims, batch ≤ max_batch, finite)
+        │
+        ▼  bulkhead: ≤ max_concurrent calls in flight (else 503)
+  circuit breaker ── open? ──────────────────────────────┐
+        │ closed / half-open probe                        │
+        ▼                                                 ▼
+  tfserving:   POST /v1/models/{m}[/versions/{v}]:predict    baseline logistic
+  onnxruntime: POST /v2/models/{m}[/versions/{v}]/infer     (fallback: true →
+               (Open Inference Protocol v2; input name        "degraded": true)
+                discovered from GET /v2/models/{m})
+        │  timeout per call · retries on 5xx/429/network · 4xx = client error
+        ▼
+  {result, class, outputs} per instance + backend, model, version, latency
+```
+
+- `tensorflow_model/export_models.py` trains the Keras DNN (Dense 128 → 64 → softmax) and exports **the same weights** twice. One copy is a SavedModel for TF Serving (`serving/tensorshadow/1`, signature `serving_default`, input `features`, output `probabilities`), built with Keras `ExportArchive` so that TF Serving can restore the Keras 3 variables. The other is an ONNX graph for ONNX Runtime (`onnx/tensorshadow/1/model.onnx`, opset 17). The exporter fails if the reloaded SavedModel and ONNX Runtime disagree by more than 1e-5.
+- `tensorflow_model/onnx_server.py` is a stdlib + `onnxruntime` implementation of the Open Inference Protocol v2 over a Triton-style model repository. The Go client works unchanged against it, against Triton's onnxruntime backend, and against KServe.
+- `GET /api/v1/model` reports backend readiness (TF Serving `model_version_status`, or v2 `ready` + metadata) and counters. Prometheus gauges cover requests, failures, fallbacks and breaker state.
+
+## 7. Appearance re-identification (DeepSORT-style)
+
+SORT loses a track after `max_age` missed frames, so anyone hidden longer than that returns with a new ID, and tripwire crossings made while hidden are lost. When detections carry an `embedding`, the tracker adds appearance:
+
+1. **Gallery:** every track stores its last `feature_budget` L2-normalised embeddings. The appearance distance is the minimum cosine distance to the gallery (DeepSORT's nearest-neighbour metric).
+2. **Matching cascade (stage A):** confirmed tracks with a gallery are matched first, most recently seen first. A pair is feasible only if its cosine distance is ≤ `appearance_threshold` **and** it passes a **Mahalanobis motion gate** (χ², 2 dof, 99 %) on the Kalman-predicted centre. The gate variance grows while a track coasts, so it widens automatically during an occlusion but still rejects implausible jumps. The same sparse component-wise Hungarian solver as the IoU stage is used.
+3. **IoU stage (B):** tentative tracks, tracks without appearance, and anything left over are associated by IoU exactly as before, so detections without embeddings behave like pure SORT.
+4. **Longer memory:** tracks with appearance survive `reid_max_age` frames (default 90) instead of `max_age` (15). A match after more than `max_age` frames is counted as a *recovery* (`analytics.reid.recoveries`, `track.reidentified`). Crossings are evaluated from the last *measured* position, so a line crossed behind an occluder is still counted when the person reappears.
+
+Embeddings can come from any ReID or face-recognition network (OSNet/FastReID for people, ArcFace for faces). The dashboard sends a 128-bin Hellinger-normalised colour histogram of the face and hair region: a classic appearance cue that is cheap to compute in the browser.
+
+## 8. Visible/IR co-registration (`internal/coreg`)
+
+- **Calibration:** point correspondences (≥ 4 for a homography, ≥ 3 for affine), typically the corners of a heated calibration target seen by both cameras. The estimator is **normalised DLT** (Hartley conditioning) with linear least squares, and reports the reprojection RMSE and maximum error in thermal pixels, graded good (< 1 px), fair (< 2.5 px) or poor. A known matrix can also be supplied. Rigs are created through the API or preloaded from `coregistration.rigs` in the config.
+- **Runtime:** `/thermal/analyze` and `/thermal/render` accept `rig` plus `visible_rois`, the RGB detector's boxes in visible pixels (as `vbox=x,y,w,h[,id]` query parameters for binary uploads). The four corners of each box are projected, their bounding box is taken, enlarged by `margin` (default 10 %) to absorb parallax for subjects off the calibration plane, and clipped to the thermal frame. Only skin-temperature pixels inside the ROI are measured, so the margin does not bias the reading.
+- **Traceability:** each thermal subject carries `roi_index` and echoes its `visible_roi` (including the caller's `id`, e.g. a crowd track ID), so fever-screening results join back to RGB identities. Boxes that miss the thermal view are listed in `coregistration.outside_frame`.
+
 ## Legacy components
 
-- **TensorFlow** (`tensorflow_model/`): the DNN training and inference scripts. `/api/v1/predict` keeps its v1 contract and uses a baseline logistic scorer until a TF-Serving or ONNX runtime is wired in.
+- **TensorFlow** (`tensorflow_model/`): the training scripts (`model.py`, `train.py`, `inference.py`) plus the serving exporter above.
 - **R** (`r_analysis/`): `ggplot2` reporting on exported analytics.

@@ -25,6 +25,11 @@ def check_structure() -> bool:
         'go_backend/internal/tracking/tracker.go',
         'go_backend/internal/server/server.go',
         'clients/python/tensorshadow_client.py',
+        'go_backend/internal/inference/inference.go',
+        'go_backend/internal/coreg/coreg.go',
+        'tensorflow_model/export_models.py', 'tensorflow_model/onnx_server.py',
+        'tensorflow_model/onnx/tensorshadow/1/model.onnx',
+        'tensorflow_model/serving/tensorshadow/1/saved_model.pb',
     ]
 
     for f in required_files:
@@ -40,9 +45,11 @@ def simulate_pipeline() -> None:
     print("1. [Python] Initializing Brain (TensorFlow Model)...")
     print("   - Logic: 10-input DNN with Dropout and BatchNormalization.")
     print("2. [Go] Starting high-concurrency API gateway (worker pool + back-pressure)...")
-    print("   - Core:    /health, /stats, /metrics, /predict")
+    print("   - Core:    /health, /stats, /metrics")
+    print("   - Models:  /predict, /model → TF Serving | ONNX Runtime (OIP v2) | baseline")
     print("   - IR:      /thermal/analyze, /thermal/render (JSON or raw uint16 buffers)")
-    print("   - Crowd:   /crowd/sessions/{id}/frames, /analytics, /heatmap, /stream (SSE)")
+    print("   - Coreg:   /coreg/rigs → visible/IR homography drives thermal ROIs")
+    print("   - Crowd:   /crowd/sessions/{id}/frames, /analytics, /heatmap, /stream (SSE), ReID")
     print("3. [R] Preparing Analytical Engine...")
     print("   - Reporting: ggplot2 Visualisation active.")
     print("\n[SUCCESS] System architecture is valid and components are linked via /configs/config.yaml")

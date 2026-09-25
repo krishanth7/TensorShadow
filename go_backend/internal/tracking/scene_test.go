@@ -155,3 +155,60 @@ func absInt(x int) int {
 	}
 	return x
 }
+
+// TestReIDAcrossOcclusion is the re-identification gate quoted in the README.
+// A 200 px pillar covers the counting line, so every crossing happens while
+// the pedestrian is hidden for 22–40 frames (> max_age). Pure IoU tracking
+// must lose these identities; appearance embeddings must recover them.
+func TestReIDAcrossOcclusion(t *testing.T) {
+	if testing.Short() {
+		t.Skip("occlusion sweep skipped in -short mode")
+	}
+	type tally struct{ crossings, observable, fragments, recoveries int }
+	run := func(withEmbeddings bool) tally {
+		var s tally
+		for seed := int64(1); seed <= 50; seed++ {
+			scene := sim.OccludedCrowdScene()
+			scene.Seed = seed
+			seq := scene.Generate()
+			if !withEmbeddings {
+				for _, f := range seq.Frames {
+					for i := range f {
+						f[i].Embedding = nil
+					}
+				}
+			}
+			a := runScene(t, tracking.NewManager(tracking.DefaultConfig()), fmt.Sprintf("occ-%d", seed), seq).Analytics
+			s.crossings += int(a.Lines[0].In + a.Lines[0].Out)
+			s.observable += seq.Truth.LeftToRight + seq.Truth.RightToLeft - seq.Truth.HiddenCrossings
+			s.fragments += absInt(int(a.UniqueSubjects) - seq.Truth.Visible)
+			s.recoveries += int(a.ReID.Recoveries)
+		}
+		return s
+	}
+	iou, reid := run(false), run(true)
+	t.Logf("IoU only: %d/%d observable crossings, %d identity errors", iou.crossings, iou.observable, iou.fragments)
+	t.Logf("ReID:     %d/%d observable crossings, %d identity errors, %d recoveries", reid.crossings, reid.observable, reid.fragments, reid.recoveries)
+
+	if iou.crossings != 0 || iou.fragments < 1000 {
+		t.Errorf("scene is not hard enough: IoU-only tracking kept identities (%+v)", iou)
+	}
+	if reid.crossings != reid.observable {
+		t.Errorf("ReID counted %d of %d observable crossings", reid.crossings, reid.observable)
+	}
+	if float64(reid.fragments) > 0.01*1200 {
+		t.Errorf("ReID identity errors %d exceed 1%%", reid.fragments)
+	}
+}
+
+func BenchmarkTrackerReID(b *testing.B) {
+	seq := sim.OccludedCrowdScene().Generate()
+	m := tracking.NewManager(tracking.DefaultConfig())
+	sess, _ := m.Create(tracking.SessionConfig{FrameWidth: 1280, FrameHeight: 720})
+	now := time.Now()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sess.Process(tracking.FrameInput{Detections: seq.Frames[i%len(seq.Frames)]}, now)
+	}
+}

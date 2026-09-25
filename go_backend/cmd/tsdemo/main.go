@@ -47,10 +47,185 @@ func run(base, out string) error {
 	}
 	fmt.Printf("TensorShadow backend %v at %s (status: %v)\n\n", health["version"], base, health["status"])
 
+	if err := modelDemo(base); err != nil {
+		return err
+	}
 	if err := thermalDemo(base, out); err != nil {
 		return err
 	}
-	return crowdDemo(base, out)
+	if err := coregDemo(base, out); err != nil {
+		return err
+	}
+	if err := crowdDemo(base, out); err != nil {
+		return err
+	}
+	return reidDemo(base)
+}
+
+func modelDemo(base string) error {
+	fmt.Println("━━ Model serving (/api/v1/predict) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	var info struct {
+		Backend string `json:"backend"`
+		URL     string `json:"url"`
+		Model   string `json:"model"`
+		Status  struct {
+			Ready    bool           `json:"ready"`
+			State    string         `json:"state"`
+			Versions []string       `json:"versions"`
+			Metadata map[string]any `json:"metadata"`
+		} `json:"status"`
+	}
+	if err := call("GET", base+"/api/v1/model", nil, &info); err != nil {
+		return err
+	}
+	fmt.Printf("backend %s  model %s  url %s  ready=%v state=%s versions=%v\n",
+		info.Backend, info.Model, orDash(info.URL), info.Status.Ready, info.Status.State, info.Status.Versions)
+
+	batch := [][]float64{
+		{0.4, -0.2, 0.1, 0.3, -0.5, 0.2, 0.0, 0.6, -0.1, 0.3},
+		{-1.2, 0.5, 0.3, -0.4, 0.1, -0.9, -0.2, -0.3, 0.2, -0.8},
+	}
+	var res struct {
+		Predictions []struct {
+			Outputs []float64 `json:"outputs"`
+			Result  float64   `json:"result"`
+			Class   int       `json:"class"`
+		} `json:"predictions"`
+		Backend   string  `json:"backend"`
+		Model     string  `json:"model"`
+		Version   string  `json:"version"`
+		LatencyMs float64 `json:"latency_ms"`
+		Degraded  bool    `json:"degraded"`
+	}
+	if err := call("POST", base+"/api/v1/predict", map[string]any{"instances": batch}, &res); err != nil {
+		return err
+	}
+	for i, p := range res.Predictions {
+		fmt.Printf("instance %d → class %d  p=%.6f  outputs=%v\n", i, p.Class, p.Result, p.Outputs)
+	}
+	fmt.Printf("served by %s (model %s, version %s) in %.2f ms, degraded=%v\n\n",
+		res.Backend, res.Model, orDash(res.Version), res.LatencyMs, res.Degraded)
+	return nil
+}
+
+func coregDemo(base, out string) error {
+	fmt.Println("━━ Visible/IR co-registration → thermal ROIs from the RGB detector ━━━━━━━━━━")
+	scene := sim.DemoCoregScene()
+	id := fmt.Sprintf("demo-rig-%d", time.Now().UnixNano())
+	var rig struct {
+		RMSE     float64 `json:"rmse_px"`
+		MaxError float64 `json:"max_error_px"`
+		Quality  string  `json:"quality"`
+		Points   int     `json:"points"`
+	}
+	if err := call("POST", base+"/api/v1/coreg/rigs", map[string]any{
+		"id": id, "name": "Demo dual-sensor head",
+		"visible": map[string]int{"width": 1280, "height": 960}, "thermal": map[string]int{"width": 160, "height": 120},
+		"points": scene.Calibration,
+	}, &rig); err != nil {
+		return err
+	}
+	defer call("DELETE", base+"/api/v1/coreg/rigs/"+id, nil, nil)
+	fmt.Printf("rig calibrated from %d heated-target points: RMSE %.3f px, max %.3f px (%s)\n\n",
+		rig.Points, rig.RMSE, rig.MaxError, rig.Quality)
+
+	th := sim.DemoThermalScene()
+	amb := th.AmbientC
+	req := thermal.FrameRequest{Width: th.Width, Height: th.Height, Data: th.Render(), AmbientTempC: &amb,
+		Rig: id, VisibleROIs: scene.FaceBoxes}
+	var res struct {
+		thermal.Result
+		Coreg struct {
+			Mapped int `json:"mapped"`
+		} `json:"coregistration"`
+	}
+	if err := call("POST", base+"/api/v1/thermal/analyze", req, &res); err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "RGB detection\tVisible box (x,y,w,h)\tThermal ROI\tCanthus\tStatus\tLiveness")
+	for _, s := range res.Subjects {
+		v := s.VisibleROI
+		live := "LIVE"
+		if !s.Liveness.Live {
+			live = "SPOOF"
+		}
+		fmt.Fprintf(tw, "%s\t%.0f,%.0f,%.0f,%.0f\t%d,%d,%d,%d\t%.2f °C\t%s\t%s\n", v.ID, v.X, v.Y, v.W, v.H,
+			s.ROI.X, s.ROI.Y, s.ROI.W, s.ROI.H, s.Canthus.TempC, strings.ToUpper(s.Status), live)
+	}
+	tw.Flush()
+
+	png, err := raw("POST", base+"/api/v1/thermal/render?palette=ironbow&scale=4&annotate=true", req)
+	if err != nil {
+		return err
+	}
+	p := filepath.Join(out, "thermal_coreg.png")
+	if err := os.WriteFile(p, png, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("\n%d RGB boxes mapped into the thermal frame; annotated render → %s\n\n", res.Coreg.Mapped, p)
+	return nil
+}
+
+func reidDemo(base string) error {
+	fmt.Println("━━ Appearance re-identification through long occlusion ━━━━━━━━━━━━━━━━━━━━━")
+	scene := sim.OccludedCrowdScene()
+	seq := scene.Generate()
+	fmt.Printf("720p scene, %d pedestrians, a %g px pillar over the counting line hides everyone for up to %d frames (max_age = 15)\n\n",
+		scene.Pedestrians, scene.Occluder.X1-scene.Occluder.X0, seq.Truth.LongestOcclusion)
+
+	type outcome struct {
+		unique, crossings, recoveries int
+	}
+	runOnce := func(withEmbeddings bool) (outcome, error) {
+		id := fmt.Sprintf("reid-%v-%d", withEmbeddings, time.Now().UnixNano())
+		cfg := tracking.SessionConfig{ID: id, FrameWidth: scene.Width, FrameHeight: scene.Height,
+			Lines: []tracking.Tripwire{{ID: "mid", A: tracking.Point{X: scene.Width / 2, Y: 0}, B: tracking.Point{X: scene.Width / 2, Y: scene.Height}}}}
+		if err := call("POST", base+"/api/v1/crowd/sessions", cfg, nil); err != nil {
+			return outcome{}, err
+		}
+		defer call("DELETE", base+"/api/v1/crowd/sessions/"+id, nil, nil)
+		var last tracking.FrameResult
+		for _, f := range seq.Frames {
+			dets := f
+			if !withEmbeddings {
+				dets = make([]tracking.Detection, len(f))
+				for i, d := range f {
+					d.Embedding = nil
+					dets[i] = d
+				}
+			}
+			if err := call("POST", base+"/api/v1/crowd/sessions/"+id+"/frames", tracking.FrameInput{Detections: dets}, &last); err != nil {
+				return outcome{}, err
+			}
+		}
+		a := last.Analytics
+		return outcome{int(a.UniqueSubjects), int(a.Lines[0].In + a.Lines[0].Out), int(a.ReID.Recoveries)}, nil
+	}
+	iou, err := runOnce(false)
+	if err != nil {
+		return err
+	}
+	reid, err := runOnce(true)
+	if err != nil {
+		return err
+	}
+	observable := seq.Truth.LeftToRight + seq.Truth.RightToLeft - seq.Truth.HiddenCrossings
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "Metric\tIoU only (SORT)\tReID (DeepSORT-style)\tGround truth")
+	fmt.Fprintf(tw, "Unique identities\t%d\t%d\t%d\n", iou.unique, reid.unique, seq.Truth.Visible)
+	fmt.Fprintf(tw, "Line crossings counted\t%d\t%d\t%d\n", iou.crossings, reid.crossings, observable)
+	fmt.Fprintf(tw, "Identities recovered after occlusion\t%d\t%d\t–\n", iou.recoveries, reid.recoveries)
+	tw.Flush()
+	fmt.Println()
+	return nil
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "–"
+	}
+	return s
 }
 
 func thermalDemo(base, out string) error {

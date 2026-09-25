@@ -110,6 +110,21 @@ type FrameRequest struct {
 	// (e.g. from a co-registered visible-light face detector). When empty,
 	// subjects are segmented automatically.
 	ROIs []Rect `json:"rois,omitempty"`
+	// Rig names a visible/IR co-registration rig; VisibleROIs are face boxes
+	// from an RGB detector, in visible-camera pixels, mapped into this frame
+	// through the rig's homography. Mutually exclusive with ROIs.
+	Rig         string       `json:"rig,omitempty"`
+	VisibleROIs []VisibleBox `json:"visible_rois,omitempty"`
+}
+
+// VisibleBox is a detection box in visible-camera pixels. ID lets callers
+// join thermal results back to their RGB track (e.g. a crowd track ID).
+type VisibleBox struct {
+	X  float64 `json:"x"`
+	Y  float64 `json:"y"`
+	W  float64 `json:"w"`
+	H  float64 `json:"h"`
+	ID string  `json:"id,omitempty"`
 }
 
 // Frame is a decoded, emissivity-corrected temperature image in °C.

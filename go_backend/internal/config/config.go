@@ -11,6 +11,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/TensorShadow/TensorShadow/go_backend/internal/coreg"
+	"github.com/TensorShadow/TensorShadow/go_backend/internal/inference"
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/thermal"
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/tracking"
 )
@@ -38,10 +40,17 @@ type Concurrency struct {
 
 // Config is the complete backend configuration.
 type Config struct {
-	Server      Server          `yaml:"server"`
-	Concurrency Concurrency     `yaml:"concurrency"`
-	Thermal     thermal.Config  `yaml:"thermal"`
-	Tracking    tracking.Config `yaml:"tracking"`
+	Server      Server           `yaml:"server"`
+	Concurrency Concurrency      `yaml:"concurrency"`
+	Thermal     thermal.Config   `yaml:"thermal"`
+	Tracking    tracking.Config  `yaml:"tracking"`
+	Inference   inference.Config `yaml:"inference"`
+	Coreg       Coregistration   `yaml:"coregistration"`
+}
+
+// Coregistration preloads calibrated visible/IR camera rigs.
+type Coregistration struct {
+	Rigs []coreg.RigConfig `yaml:"rigs"`
 }
 
 // Default returns the built-in configuration.
@@ -64,8 +73,9 @@ func Default() Config {
 			RateLimitRPS:   200,
 			RateLimitBurst: 400,
 		},
-		Thermal:  thermal.DefaultConfig(),
-		Tracking: tracking.DefaultConfig(),
+		Thermal:   thermal.DefaultConfig(),
+		Tracking:  tracking.DefaultConfig(),
+		Inference: inference.DefaultConfig(),
 	}
 }
 
@@ -118,6 +128,12 @@ func applyEnv(c *Config) error {
 			*dst = n
 		}
 	}
+	if v := os.Getenv("TS_INFERENCE_BACKEND"); v != "" {
+		c.Inference.Backend = v
+	}
+	if v := os.Getenv("TS_INFERENCE_URL"); v != "" {
+		c.Inference.URL = v
+	}
 	if v := os.Getenv("TS_RATE_LIMIT_RPS"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
@@ -148,5 +164,14 @@ func (c Config) Validate() error {
 	if err := c.Thermal.Validate(); err != nil {
 		return err
 	}
-	return c.Tracking.Validate()
+	if err := c.Tracking.Validate(); err != nil {
+		return err
+	}
+	if err := c.Inference.Validate(); err != nil {
+		return err
+	}
+	if _, err := coreg.NewRegistry(c.Coreg.Rigs); err != nil {
+		return err
+	}
+	return nil
 }
