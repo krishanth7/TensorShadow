@@ -1,8 +1,9 @@
 import os
 import sys
 
-def check_structure():
+def check_structure() -> bool:
     print("=== TensorShadow System Check ===")
+    ok = True
     required_dirs = [
         'tensorflow_model', 'r_analysis', 'go_backend', 
         'api', 'data', 'configs', 'tests', 'docs'
@@ -13,10 +14,17 @@ def check_structure():
             print(f"[✓] Directory found: {d}")
         else:
             print(f"[✗] Directory MISSING: {d}")
+            ok = False
 
     required_files = [
-        'README.md', 'requirements.txt', 'go.mod', '.gitignore',
-        'tensorflow_model/train.py', 'go_backend/main.go', 'r_analysis/analysis.R'
+        'README.md', 'requirements.txt', 'go.mod', 'go.sum', '.gitignore', 'Makefile', 'Dockerfile',
+        'tensorflow_model/train.py', 'r_analysis/analysis.R', 'api/openapi.yaml', 'configs/config.yaml',
+        'go_backend/main.go', 'go_backend/web/index.html',
+        'go_backend/internal/workerpool/pool.go',
+        'go_backend/internal/thermal/analyze.go',
+        'go_backend/internal/tracking/tracker.go',
+        'go_backend/internal/server/server.go',
+        'clients/python/tensorshadow_client.py',
     ]
 
     for f in required_files:
@@ -24,19 +32,24 @@ def check_structure():
             print(f"[✓] File found: {f}")
         else:
             print(f"[✗] File MISSING: {f}")
+            ok = False
+    return ok
 
-def simulate_pipeline():
+def simulate_pipeline() -> None:
     print("\n=== Simulating TensorShadow Pipeline ===")
     print("1. [Python] Initializing Brain (TensorFlow Model)...")
     print("   - Logic: 10-input DNN with Dropout and BatchNormalization.")
-    print("2. [Go] Starting API Gateway...")
-    print("   - Routes: /predict (POST), /health (GET), /stats (GET).")
+    print("2. [Go] Starting high-concurrency API gateway (worker pool + back-pressure)...")
+    print("   - Core:    /health, /stats, /metrics, /predict")
+    print("   - IR:      /thermal/analyze, /thermal/render (JSON or raw uint16 buffers)")
+    print("   - Crowd:   /crowd/sessions/{id}/frames, /analytics, /heatmap, /stream (SSE)")
     print("3. [R] Preparing Analytical Engine...")
     print("   - Reporting: ggplot2 Visualisation active.")
     print("\n[SUCCESS] System architecture is valid and components are linked via /configs/config.yaml")
 
 if __name__ == "__main__":
-    check_structure()
+    structure_ok = check_structure()
     simulate_pipeline()
+    sys.exit(0 if structure_ok else 1)
 
 

@@ -1,31 +1,581 @@
-openapi: 3.0.0
+openapi: 3.0.3
 info:
   title: TensorShadow API
-  description: High-performance intelligence framework API
-  version: 1.0.0
+  version: 2.0.0
+  description: |
+    High-concurrency biometric intelligence API: infrared (IR) thermal
+    screening, multi-subject tracking and crowd analytics.
+
+    CPU-bound work runs on a bounded worker pool. When the pool is saturated
+    the API sheds load with `503 overloaded` + `Retry-After`; per-client rate
+    limiting answers `429 rate_limited` + `Retry-After`. Every response carries
+    an `X-Request-ID` header (propagated if supplied by the client).
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:8080
+tags:
+  - name: System
+  - name: Thermal
+    description: Infrared radiometric analysis
+  - name: Crowd
+    description: Multi-subject tracking and crowd analytics
+
 paths:
   /api/v1/health:
     get:
-      summary: Health check
+      tags: [System]
+      summary: Liveness probe (never rate limited)
       responses:
         '200':
-          description: OK
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: up }
+                  service: { type: string, example: TensorShadow-backend }
+                  version: { type: string, example: 2.0.0 }
+                  uptime_seconds: { type: number }
+
+  /api/v1/stats:
+    get:
+      tags: [System]
+      summary: Runtime, worker-pool, HTTP-latency and crowd statistics
+      responses:
+        '200':
+          description: Statistics snapshot
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /metrics:
+    get:
+      tags: [System]
+      summary: Prometheus metrics (text exposition format 0.0.4)
+      responses:
+        '200':
+          description: Metrics
+          content:
+            text/plain: { schema: { type: string } }
+
   /api/v1/predict:
     post:
-      summary: Model inference
+      tags: [System]
+      summary: Score a feature vector (v1 compatibility; baseline logistic model)
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              required: [data]
               properties:
-                data:
-                  type: array
-                  items:
-                    type: number
+                data: { type: array, items: { type: number }, minItems: 1, maxItems: 4096 }
       responses:
         '200':
-          description: OK
+          description: Prediction
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  result: { type: number }
+                  model: { type: string, example: baseline-logistic }
+                  timestamp: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '503': { $ref: '#/components/responses/Overloaded' }
 
+  /api/v1/thermal/analyze:
+    post:
+      tags: [Thermal]
+      summary: Segment, screen and liveness-check every face in a radiometric frame
+      description: |
+        Accepts either a JSON frame or a raw little-endian sensor buffer
+        (`application/octet-stream`, ~9× smaller). For binary uploads the frame
+        metadata is passed as query parameters.
+      parameters:
+        - $ref: '#/components/parameters/Width'
+        - $ref: '#/components/parameters/Height'
+        - $ref: '#/components/parameters/DType'
+        - $ref: '#/components/parameters/Format'
+        - $ref: '#/components/parameters/AmbientC'
+        - $ref: '#/components/parameters/Emissivity'
+        - $ref: '#/components/parameters/ROI'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ThermalFrame' }
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: Analysis result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ThermalResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Overloaded' }
 
+  /api/v1/thermal/render:
+    post:
+      tags: [Thermal]
+      summary: Render a frame to a false-colour PNG
+      parameters:
+        - { name: palette, in: query, schema: { type: string, enum: [ironbow, rainbow, whitehot, blackhot], default: ironbow } }
+        - { name: scale, in: query, schema: { type: integer, minimum: 1, maximum: 16, default: 4 } }
+        - { name: min_c, in: query, schema: { type: number }, description: Colour scale lower bound (°C) }
+        - { name: max_c, in: query, schema: { type: number }, description: Colour scale upper bound (°C) }
+        - { name: annotate, in: query, schema: { type: boolean, default: false }, description: Draw status-coloured subject boxes and canthus crosshairs }
+        - $ref: '#/components/parameters/Width'
+        - $ref: '#/components/parameters/Height'
+        - $ref: '#/components/parameters/DType'
+        - $ref: '#/components/parameters/Format'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ThermalFrame' }
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: PNG image
+          content:
+            image/png: { schema: { type: string, format: binary } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/v1/thermal/palettes:
+    get:
+      tags: [Thermal]
+      summary: List false-colour palettes
+      responses:
+        '200':
+          description: Palettes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  palettes: { type: array, items: { type: string } }
+                  default: { type: string }
+
+  /api/v1/crowd/sessions:
+    post:
+      tags: [Crowd]
+      summary: Open a tracking session (one per camera stream)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SessionConfig' }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionInfo' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+    get:
+      tags: [Crowd]
+      summary: List sessions
+      responses:
+        '200':
+          description: Sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  sessions: { type: array, items: { $ref: '#/components/schemas/SessionInfo' } }
+
+  /api/v1/crowd/sessions/{id}:
+    parameters: [ { $ref: '#/components/parameters/SessionID' } ]
+    get:
+      tags: [Crowd]
+      summary: Describe a session
+      responses:
+        '200':
+          description: Session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionInfo' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Crowd]
+      summary: Close a session (disconnects stream subscribers)
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/crowd/sessions/{id}/frames:
+    parameters: [ { $ref: '#/components/parameters/SessionID' } ]
+    post:
+      tags: [Crowd]
+      summary: Ingest one frame of detections
+      description: Frames of one session are serialised; send them in capture order.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FrameInput' }
+      responses:
+        '200':
+          description: Tracks and analytics after this frame
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FrameResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Overloaded' }
+
+  /api/v1/crowd/sessions/{id}/analytics:
+    parameters: [ { $ref: '#/components/parameters/SessionID' } ]
+    get:
+      tags: [Crowd]
+      summary: Latest analytics snapshot
+      responses:
+        '200':
+          description: Analytics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id: { type: string }
+                  analytics: { $ref: '#/components/schemas/Analytics' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/crowd/sessions/{id}/heatmap:
+    parameters: [ { $ref: '#/components/parameters/SessionID' } ]
+    get:
+      tags: [Crowd]
+      summary: Spatial occupancy heatmap (JSON grid or PNG)
+      parameters:
+        - { name: format, in: query, schema: { type: string, enum: [json, png], default: json } }
+        - { name: palette, in: query, schema: { type: string, default: ironbow } }
+        - { name: cell, in: query, schema: { type: integer, minimum: 1, maximum: 64, default: 16 }, description: PNG pixels per grid cell }
+      responses:
+        '200':
+          description: Heatmap
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id: { type: string }
+                  heatmap:
+                    type: object
+                    properties:
+                      cols: { type: integer }
+                      rows: { type: integer }
+                      max_subject_frames: { type: number }
+                      cells: { type: array, items: { type: number, minimum: 0, maximum: 1 } }
+            image/png: { schema: { type: string, format: binary } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/crowd/sessions/{id}/stream:
+    parameters: [ { $ref: '#/components/parameters/SessionID' } ]
+    get:
+      tags: [Crowd]
+      summary: Live Server-Sent Events stream of every processed frame
+      description: |
+        Emits `event: frame` with a FrameResult JSON payload for each frame,
+        a `: ping` comment every 15 s, and `event: close` when the session ends.
+      responses:
+        '200':
+          description: Event stream
+          content:
+            text/event-stream: { schema: { type: string } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  parameters:
+    SessionID: { name: id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9_.-]{1,64}$' } }
+    Width: { name: width, in: query, schema: { type: integer }, description: Binary uploads only — frame width }
+    Height: { name: height, in: query, schema: { type: integer }, description: Binary uploads only — frame height }
+    DType: { name: dtype, in: query, schema: { type: string, enum: [uint16, float32], default: uint16 }, description: Binary uploads only }
+    Format:
+      name: format
+      in: query
+      schema: { type: string, enum: [centikelvin, raw16, celsius, kelvin] }
+      description: Binary uploads only — default centikelvin for uint16, celsius for float32 (raw16 also needs gain & offset)
+    AmbientC: { name: ambient_c, in: query, schema: { type: number }, description: Binary uploads only — ambient air temperature (°C) }
+    Emissivity: { name: emissivity, in: query, schema: { type: number, minimum: 0, maximum: 1 }, description: Binary uploads only }
+    ROI: { name: roi, in: query, schema: { type: string, example: '12,20,30,38' }, description: 'Binary uploads only — x,y,w,h face box; repeatable' }
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Session not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooLarge:
+      description: Body exceeds server.max_body_bytes
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Per-client rate limit exceeded
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Overloaded:
+      description: Worker pool saturated — retry after the indicated delay
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: invalid_request }
+            message: { type: string }
+        request_id: { type: string }
+
+    Rect:
+      type: object
+      properties: { x: { type: integer }, y: { type: integer }, w: { type: integer }, h: { type: integer } }
+
+    ThermalFrame:
+      type: object
+      required: [width, height, data]
+      properties:
+        width: { type: integer }
+        height: { type: integer }
+        format: { type: string, enum: [celsius, kelvin, centikelvin, raw16], default: celsius }
+        data: { type: array, items: { type: number }, description: Row-major apparent temperatures / counts }
+        ambient_temp_c: { type: number }
+        rois: { type: array, items: { $ref: '#/components/schemas/Rect' } }
+        calibration:
+          type: object
+          properties:
+            emissivity: { type: number, default: 0.98 }
+            reflected_temp_c: { type: number, description: Defaults to ambient_temp_c, then the server default }
+            gain: { type: number, description: raw16 only }
+            offset: { type: number, description: raw16 only }
+
+    ThermalSubject:
+      type: object
+      properties:
+        index: { type: integer }
+        roi: { $ref: '#/components/schemas/Rect' }
+        skin:
+          type: object
+          properties:
+            pixels: { type: integer }
+            min_c: { type: number }
+            max_c: { type: number }
+            mean_c: { type: number }
+            std_c: { type: number }
+            p50_c: { type: number }
+            p90_c: { type: number }
+        canthus:
+          type: object
+          properties: { x: { type: integer }, y: { type: integer }, temp_c: { type: number } }
+        core_estimate_c: { type: number }
+        status: { type: string, enum: [normal, elevated, fever, indeterminate] }
+        liveness:
+          type: object
+          properties:
+            live: { type: boolean }
+            score: { type: number }
+            checks:
+              type: array
+              items:
+                type: object
+                properties:
+                  name: { type: string, enum: [physiological_skin_range, facial_thermal_gradient, periorbital_hotspot, ambient_contrast] }
+                  passed: { type: boolean }
+                  value: { type: number }
+                  limit: { type: string }
+
+    ThermalResult:
+      type: object
+      properties:
+        frame:
+          type: object
+          properties:
+            width: { type: integer }
+            height: { type: integer }
+            min_c: { type: number }
+            max_c: { type: number }
+            mean_c: { type: number }
+            ambient_c: { type: number, nullable: true }
+            ambient_source: { type: string, enum: [provided, estimated_background_median, unknown] }
+            emissivity: { type: number }
+            reflected_c: { type: number }
+        subjects: { type: array, items: { $ref: '#/components/schemas/ThermalSubject' } }
+        summary: { type: object, additionalProperties: { type: integer } }
+        processing_ms: { type: number }
+        request_id: { type: string }
+
+    Point:
+      type: object
+      properties: { x: { type: number }, y: { type: number } }
+
+    BBox:
+      type: object
+      required: [x, y, w, h]
+      properties: { x: { type: number }, y: { type: number }, w: { type: number }, h: { type: number } }
+
+    SessionConfig:
+      type: object
+      required: [frame_width, frame_height]
+      properties:
+        id: { type: string, description: Generated when omitted }
+        name: { type: string }
+        frame_width: { type: number }
+        frame_height: { type: number }
+        area_m2: { type: number, description: Ground area in view; enables persons/m² density }
+        heatmap_cols: { type: integer, default: 32 }
+        heatmap_rows: { type: integer, description: Defaults to the frame aspect ratio }
+        lines:
+          type: array
+          maxItems: 32
+          items:
+            type: object
+            required: [a, b]
+            description: Tripwire. Looking from A towards B, crossing right→left counts as "in".
+            properties:
+              id: { type: string }
+              name: { type: string }
+              a: { $ref: '#/components/schemas/Point' }
+              b: { $ref: '#/components/schemas/Point' }
+        zones:
+          type: array
+          maxItems: 32
+          items:
+            type: object
+            required: [polygon]
+            properties:
+              id: { type: string }
+              name: { type: string }
+              polygon: { type: array, minItems: 3, items: { $ref: '#/components/schemas/Point' } }
+              capacity: { type: integer }
+
+    SessionInfo:
+      type: object
+      properties:
+        config: { $ref: '#/components/schemas/SessionConfig' }
+        created_at: { type: string, format: date-time }
+        last_active_at: { type: string, format: date-time }
+        frames_processed: { type: integer }
+        active_subjects: { type: integer }
+        subscribers: { type: integer }
+
+    FrameInput:
+      type: object
+      properties:
+        timestamp: { type: string, format: date-time, description: Capture time; defaults to server time }
+        detections:
+          type: array
+          maxItems: 512
+          items:
+            type: object
+            required: [bbox]
+            properties:
+              bbox: { $ref: '#/components/schemas/BBox' }
+              score: { type: number, description: 'Detector confidence; omitted = 1.0' }
+              label: { type: string }
+
+    Track:
+      type: object
+      properties:
+        id: { type: integer, description: Stable identity, issued on confirmation }
+        state: { type: string, enum: [confirmed, lost] }
+        bbox: { $ref: '#/components/schemas/BBox' }
+        center: { $ref: '#/components/schemas/Point' }
+        velocity: { $ref: '#/components/schemas/Point' }
+        age_frames: { type: integer }
+        hits: { type: integer }
+        dwell_seconds: { type: number }
+        score: { type: number }
+        label: { type: string }
+
+    Analytics:
+      type: object
+      properties:
+        active_subjects: { type: integer }
+        unique_subjects: { type: integer }
+        peak_subjects: { type: integer }
+        peak_at: { type: string, format: date-time }
+        frames_processed: { type: integer }
+        density:
+          type: object
+          properties:
+            per_m2: { type: number }
+            coverage_ratio: { type: number }
+            level: { type: string, enum: [low, moderate, high, critical] }
+            basis: { type: string, enum: [persons_per_m2, image_coverage] }
+        flow:
+          type: object
+          properties:
+            mean_vx: { type: number }
+            mean_vy: { type: number }
+            speed_px_per_frame: { type: number }
+            heading_deg: { type: number }
+            direction: { type: string }
+            coherence: { type: number }
+        dwell:
+          type: object
+          properties:
+            active_avg_seconds: { type: number }
+            active_max_seconds: { type: number }
+            completed_avg_seconds: { type: number }
+            completed_tracks: { type: integer }
+        lines:
+          type: array
+          items:
+            type: object
+            properties: { id: { type: string }, name: { type: string }, in: { type: integer }, out: { type: integer }, net: { type: integer } }
+        zones:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              name: { type: string }
+              occupancy: { type: integer }
+              peak: { type: integer }
+              entries: { type: integer }
+              capacity: { type: integer }
+              utilisation: { type: number }
+              over_capacity: { type: boolean }
+
+    FrameResult:
+      type: object
+      properties:
+        session_id: { type: string }
+        frame: { type: integer }
+        timestamp: { type: string, format: date-time }
+        tracks: { type: array, items: { $ref: '#/components/schemas/Track' } }
+        analytics: { $ref: '#/components/schemas/Analytics' }

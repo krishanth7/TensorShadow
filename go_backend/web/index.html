@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TensorShadow | Advanced AI Vision System</title>
+    <!-- External Libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --bg: #020617;
+            --primary: #0ea5e9;
+            --secondary: #6366f1;
+            --accent: #f43f5e;
+            --card-bg: rgba(15, 23, 42, 0.8);
+            --neon-glow: 0 0 15px rgba(14, 165, 233, 0.5);
+        }
+
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: var(--bg);
+            color: white;
+            font-family: 'Inter', sans-serif;
+            overflow: hidden;
+        }
+
+        /* Cyberpunk UI Layout */
+        .app-shell {
+            display: grid;
+            grid-template-columns: 350px 1fr 350px;
+            height: 100vh;
+            gap: 1px;
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .sidebar {
+            background: var(--card-bg);
+            backdrop-filter: blur(20px);
+            padding: 2rem;
+            display: flex;
+            flex-direction: column;
+            gap: 2rem;
+            z-index: 10;
+        }
+
+        /* Header Styling */
+        header h1 {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 1.5rem;
+            margin: 0;
+            background: linear-gradient(to right, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: 2px;
+        }
+
+        /* Center Vision Area */
+        .vision-container {
+            position: relative;
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+        }
+
+        #input_video {
+            display: none; /* Hidden source */
+        }
+
+        #output_canvas {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            filter: contrast(1.1) brightness(1.1);
+        }
+
+        .hud-overlay {
+            position: absolute;
+            top: 2rem;
+            left: 2rem;
+            pointer-events: none;
+        }
+
+        /* Advanced Glass Cards */
+        .module {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 1.5rem;
+            box-shadow: var(--neon-glow);
+        }
+
+        .module h3 {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.8rem;
+            color: var(--primary);
+            margin-top: 0;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .stat {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.5rem;
+            font-size: 0.9rem;
+        }
+
+        .label { color: #94a3b8; }
+        .value { color: #f8fafc; font-weight: 600; }
+
+        /* Scanning Animation */
+        .scanning-line {
+            position: absolute;
+            width: 100%;
+            height: 2px;
+            background: var(--primary);
+            box-shadow: 0 0 20px var(--primary);
+            z-index: 5;
+            animation: scan 3s linear infinite;
+            display: none;
+        }
+
+        @keyframes scan {
+            0% { top: 0; }
+            100% { top: 100%; }
+        }
+
+        /* Controls */
+        .controls {
+            position: absolute;
+            bottom: 2rem;
+            display: flex;
+            gap: 1rem;
+            z-index: 100;
+        }
+
+        .btn {
+            background: rgba(14, 165, 233, 0.2);
+            border: 1px solid var(--primary);
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 99px;
+            cursor: pointer;
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.7rem;
+            transition: 0.3s;
+            backdrop-filter: blur(10px);
+        }
+
+        .btn:hover {
+            background: var(--primary);
+            box-shadow: 0 0 20px var(--primary);
+        }
+
+        .btn.active {
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+
+        /* Profile Section */
+        .profile {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+
+        .avatar-frame {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            border: 2px solid var(--primary);
+            margin: 0 auto 1rem;
+            padding: 5px;
+            position: relative;
+        }
+
+        .avatar-frame::after {
+            content: '';
+            position: absolute;
+            top: -5px; left: -5px; right: -5px; bottom: -5px;
+            border-radius: 50%;
+            border: 2px dashed var(--secondary);
+            animation: rotate 10s linear infinite;
+        }
+
+        @keyframes rotate { from {transform: rotate(0);} to {transform: rotate(360deg);} }
+
+        #face_preview {
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            background: #1e293b;
+            object-fit: cover;
+        }
+    </style>
+</head>
+<body>
+
+<div class="app-shell">
+    <!-- Left Sidebar: Identity & Stats -->
+    <div class="sidebar">
+        <header>
+            <h1>TensorShadow</h1>
+            <p style="font-size: 0.7rem; color: #64748b;">NEURAL VISION ANALYTICS</p>
+        </header>
+
+        <div class="profile">
+            <div class="avatar-frame">
+                <canvas id="face_preview"></canvas>
+            </div>
+            <div id="user_id" style="font-family: 'Orbitron'; color: var(--primary);">SUBJECT: UNKNOWN</div>
+            <div style="font-size: 0.7rem; color: #475569; margin-top: 0.5rem;">ACCESS LEVEL: ALPHA-9</div>
+        </div>
+
+        <div class="module">
+            <h3>Neural Metrics</h3>
+            <div class="stat"><span class="label">Detection</span><span class="value" id="detect_val">0ms</span></div>
+            <div class="stat"><span class="label">Landmarks</span><span class="value">468 (3D)</span></div>
+            <div class="stat"><span class="label">Mesh Quality</span><span class="value">ULTRA</span></div>
+            <div class="stat"><span class="label">Swap Readiness</span><span class="value" style="color: #10b981;">OPTIMAL</span></div>
+        </div>
+
+        <div class="module">
+            <h3>Crowd Analysis</h3>
+            <div class="stat"><span class="label">Go Backend</span><span class="value" id="crowd_api">CHECKING…</span></div>
+            <div class="stat"><span class="label">Faces In Frame</span><span class="value" id="crowd_faces">0</span></div>
+            <div class="stat"><span class="label">Tracked / Unique</span><span class="value" id="crowd_tracked">0 / 0</span></div>
+            <div class="stat"><span class="label">Peak · Density</span><span class="value" id="crowd_peak">0 · LOW</span></div>
+        </div>
+    </div>
+
+    <!-- Center Vision Area -->
+    <div class="vision-container">
+        <div class="scanning-line" id="scanner"></div>
+        <video id="input_video"></video>
+        <canvas id="output_canvas"></canvas>
+        
+        <div class="controls">
+            <button class="btn" id="toggle_dots">SHOW LANDMARKS</button>
+            <button class="btn" id="toggle_mesh">WIRE FRAME</button>
+            <button class="btn" id="toggle_swap">CYBER-SWAP</button>
+            <button class="btn" id="toggle_scan">INIT SCAN</button>
+        </div>
+    </div>
+
+    <!-- Right Sidebar: 3D Model & Logs -->
+    <div class="sidebar">
+        <div class="module" style="height: 300px; display: flex; flex-direction: column;">
+            <h3>3D Mesh Projection</h3>
+            <div id="three_container" style="flex: 1; min-height: 200px; background: #000; border-radius: 8px;"></div>
+        </div>
+
+        <div class="module">
+            <h3>System Logs</h3>
+            <div id="logs" style="font-size: 0.7rem; color: #10b981; font-family: monospace; height: 150px; overflow-y: auto;">
+                > System Boot Sequence... DONE<br>
+                > Camera Handshake... READY<br>
+                > Loading MediaPipe FaceMesh... OK<br>
+                > Waiting for Subject Acquisition...
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const videoElement = document.getElementById('input_video');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const logs = document.getElementById('logs');
+    
+    let showDots = true;
+    let showMesh = false;
+    let cyberSwap = false;
+    let isScanning = false;
+
+    // CDN libraries can be unavailable (offline or air-gapped sites). Each
+    // subsystem degrades independently instead of aborting the whole script.
+    const HAS_3D = typeof THREE !== 'undefined';
+    const HAS_VISION = typeof FaceMesh !== 'undefined' && typeof Camera !== 'undefined';
+
+    // --- THREE.JS SETUP ---
+    const threeContainer = document.getElementById('three_container');
+    let scene, camera3d, renderer, geometry, points, lines;
+    if (HAS_3D) {
+        scene = new THREE.Scene();
+        camera3d = new THREE.PerspectiveCamera(75, threeContainer.clientWidth / threeContainer.clientHeight, 0.1, 1000);
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(threeContainer.clientWidth, threeContainer.clientHeight);
+        threeContainer.appendChild(renderer.domElement);
+
+        // Create a 3D Point Cloud for the face
+        geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(478 * 3); // 468 landmarks + 10 refined iris points, (x,y,z)
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const material = new THREE.PointsMaterial({ color: 0x0ea5e9, size: 0.05, transparent: true, opacity: 0.8 });
+        points = new THREE.Points(geometry, material);
+        scene.add(points);
+
+        // Add some lines for the wireframe effect in 3D
+        const lineMaterial = new THREE.LineBasicMaterial({ color: 0x6366f1, transparent: true, opacity: 0.2 });
+        lines = new THREE.LineSegments(geometry, lineMaterial);
+        scene.add(lines);
+
+        camera3d.position.z = 2;
+
+        const animate3d = () => {
+            requestAnimationFrame(animate3d);
+            points.rotation.y += 0.005; // Subtle auto-rotation
+            lines.rotation.y += 0.005;
+            renderer.render(scene, camera3d);
+        };
+        animate3d();
+    }
+
+    // UI Controls
+    document.getElementById('toggle_dots').onclick = (e) => { showDots = !showDots; e.target.classList.toggle('active'); };
+    document.getElementById('toggle_mesh').onclick = (e) => { showMesh = !showMesh; e.target.classList.toggle('active'); };
+    document.getElementById('toggle_swap').onclick = (e) => { cyberSwap = !cyberSwap; e.target.classList.toggle('active'); };
+    document.getElementById('toggle_scan').onclick = (e) => { 
+        isScanning = !isScanning; 
+        document.getElementById('scanner').style.display = isScanning ? 'block' : 'none';
+        e.target.classList.toggle('active');
+        addLog("> Starting High-Density Bio-Scan...");
+    };
+
+    function addLog(msg) {
+        logs.innerHTML += `<br>> ${msg}`;
+        logs.scrollTop = logs.scrollHeight;
+    }
+
+
+    // --- MULTI-SUBJECT TRACKING (Go backend: /api/v1/crowd) ---
+    // Face boxes are sent in a normalised 1000×1000 space so tracking is
+    // independent of the canvas size. Without the Go backend (e.g. when served
+    // by the Flask prototype) the dashboard still renders every face locally.
+    const MAX_FACES = 6;
+    const CROWD_SPACE = 1000;
+    const crowd = { online: false, session: null, inFlight: false, tracks: [], lastSent: 0 };
+
+    async function crowdInit() {
+        try {
+            const health = await fetch('/api/v1/health');
+            if (!health.ok) throw new Error(health.status);
+            const res = await fetch('/api/v1/crowd/sessions', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    id: 'dashboard-' + Math.random().toString(16).slice(2, 10),
+                    name: 'Browser dashboard', frame_width: CROWD_SPACE, frame_height: CROWD_SPACE,
+                    lines: [{id: 'centre', name: 'Centre line', a: {x: 500, y: 0}, b: {x: 500, y: 1000}}]
+                })
+            });
+            if (!res.ok) throw new Error(res.status);
+            crowd.session = (await res.json()).config.id;
+            crowd.online = true;
+            document.getElementById('crowd_api').innerText = 'ONLINE';
+            document.getElementById('crowd_api').style.color = '#10b981';
+            addLog(`Crowd tracking session ${crowd.session} opened.`);
+            window.addEventListener('beforeunload', () => {
+                fetch(`/api/v1/crowd/sessions/${crowd.session}`, {method: 'DELETE', keepalive: true});
+            });
+        } catch (err) {
+            document.getElementById('crowd_api').innerText = 'OFFLINE';
+            document.getElementById('crowd_api').style.color = '#f59e0b';
+            addLog('Go backend not reachable - local multi-face mode.');
+        }
+    }
+
+    function faceBox(face) {
+        let minX = 1, minY = 1, maxX = 0, maxY = 0;
+        for (const p of face) {
+            if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+            if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+        }
+        return {x: minX * CROWD_SPACE, y: minY * CROWD_SPACE,
+                w: Math.max(1, (maxX - minX) * CROWD_SPACE), h: Math.max(1, (maxY - minY) * CROWD_SPACE)};
+    }
+
+    async function crowdSubmit(faces) {
+        const now = performance.now();
+        // ~15 FPS, one request in flight: frames stay ordered per session.
+        if (!crowd.online || crowd.inFlight || now - crowd.lastSent < 66) return;
+        crowd.inFlight = true;
+        crowd.lastSent = now;
+        try {
+            const res = await fetch(`/api/v1/crowd/sessions/${crowd.session}/frames`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({detections: faces.map(f => ({bbox: faceBox(f), score: 0.9, label: 'face'}))})
+            });
+            if (res.ok) {
+                const out = await res.json();
+                crowd.tracks = out.tracks;
+                const a = out.analytics;
+                document.getElementById('crowd_tracked').innerText = `${a.active_subjects} / ${a.unique_subjects}`;
+                document.getElementById('crowd_peak').innerText = `${a.peak_subjects} · ${a.density.level.toUpperCase()}`;
+            } else if (res.status === 404) {
+                crowd.online = false; // session evicted; re-open
+                crowdInit();
+            }
+        } catch (err) {
+            /* transient network error: keep the last tracks */
+        } finally {
+            crowd.inFlight = false;
+        }
+    }
+
+    function drawCrowdTracks() {
+        const sx = canvasElement.width / CROWD_SPACE, sy = canvasElement.height / CROWD_SPACE;
+        canvasCtx.font = "600 13px Inter, sans-serif";
+        for (const t of crowd.tracks) {
+            const x = t.bbox.x * sx, y = t.bbox.y * sy, w = t.bbox.w * sx, h = t.bbox.h * sy;
+            canvasCtx.strokeStyle = t.state === 'confirmed' ? '#10b981' : '#f59e0b';
+            canvasCtx.lineWidth = 2;
+            canvasCtx.strokeRect(x, y, w, h);
+            const label = `ID ${t.id} · ${t.dwell_seconds.toFixed(1)}s`;
+            const tw = canvasCtx.measureText(label).width + 10;
+            canvasCtx.fillStyle = 'rgba(2, 6, 23, 0.75)';
+            canvasCtx.fillRect(x, y - 20, tw, 18);
+            canvasCtx.fillStyle = '#f8fafc';
+            canvasCtx.fillText(label, x + 5, y - 6);
+        }
+    }
+
+    function onResults(results) {
+        document.getElementById('detect_val').innerText = Math.round(performance.now() % 100) + 'ms';
+        
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+        
+        const faces = results.multiFaceLandmarks || [];
+        document.getElementById('crowd_faces').innerText = faces.length;
+        crowdSubmit(faces);
+
+        // 1. Update 2D overlay for every subject in view
+        faces.forEach((face) => {
+            if (showMesh) {
+                drawConnectors(canvasCtx, face, FACEMESH_TESSELATION, {color: '#C0C0C070', lineWidth: 1});
+            }
+            if (showDots) {
+                drawLandmarks(canvasCtx, face, {color: '#0ea5e9', lineWidth: 0.5, radius: 1});
+            }
+            if (cyberSwap) {
+                drawConnectors(canvasCtx, face, FACEMESH_FACE_OVAL, {color: '#f43f5e', lineWidth: 4});
+            }
+        });
+        drawCrowdTracks();
+
+        if (faces.length > 0) {
+            const landmarks = faces[0];
+
+            // 2. Update 3D Projection
+            const posAttr = HAS_3D ? geometry.attributes.position : { array: [], count: 0 };
+            for (let i = 0; i < Math.min(landmarks.length, posAttr.count); i++) {
+                const landmark = landmarks[i];
+                // Map coordinates from 0-1 to Three.js space (-1 to 1)
+                posAttr.array[i * 3] = (landmark.x - 0.5) * 4;
+                posAttr.array[i * 3 + 1] = (0.5 - landmark.y) * 4;
+                posAttr.array[i * 3 + 2] = -landmark.z * 10;
+            }
+            posAttr.needsUpdate = true;
+
+            // 3. Update Status
+            document.getElementById('user_id').innerText =
+                faces.length > 1 ? `SUBJECTS: ${faces.length} IDENTIFIED` : "SUBJECT: IDENTIFIED";
+            updateProfilePreview(results.image, landmarks);
+        } else {
+            document.getElementById('user_id').innerText = "SUBJECT: UNKNOWN";
+        }
+        canvasCtx.restore();
+    }
+
+    function updateProfilePreview(img, landmarks) {
+        const preview = document.getElementById('face_preview');
+        const pCtx = preview.getContext('2d');
+        // Draw centered on face
+        const x = landmarks[1].x * img.width;
+        const y = landmarks[1].y * img.height;
+        const size = 150;
+        pCtx.drawImage(img, x - size/2, y - size/2, size, size, 0, 0, preview.width, preview.height);
+    }
+
+    window.addEventListener('resize', () => {
+        canvasElement.width = window.innerWidth;
+        canvasElement.height = window.innerHeight;
+        if (HAS_3D) {
+            renderer.setSize(threeContainer.clientWidth, threeContainer.clientHeight);
+            camera3d.aspect = threeContainer.clientWidth / threeContainer.clientHeight;
+            camera3d.updateProjectionMatrix();
+        }
+    });
+    canvasElement.width = window.innerWidth;
+    canvasElement.height = window.innerHeight;
+
+    // The backend connection does not depend on any CDN library.
+    crowdInit();
+
+    if (HAS_VISION) {
+        const faceMesh = new FaceMesh({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+        }});
+        faceMesh.setOptions({
+            maxNumFaces: MAX_FACES,
+            refineLandmarks: true,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        faceMesh.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => { await faceMesh.send({image: videoElement}); },
+            width: 1280, height: 720
+        });
+        camera.start();
+        addLog("Neural Core Online.");
+    } else {
+        addLog("MediaPipe unavailable (CDN blocked?) - vision disabled.");
+    }
+    addLog(HAS_3D ? "3D Projection Engine Loaded." : "Three.js unavailable - 3D projection disabled.");
+
+</script>
+
+</body>
+</html>

@@ -1,0 +1,9 @@
+.git
+bin
+data
+docs
+r_analysis
+tensorflow_model
+tests
+clients
+**/__pycache__

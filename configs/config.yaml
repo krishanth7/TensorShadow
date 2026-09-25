@@ -1,6 +1,50 @@
+# TensorShadow runtime configuration.
+# Every key is optional; omitted keys fall back to the defaults compiled into
+# go_backend/internal/config. Environment variables (TS_PORT, TS_ENV,
+# TS_WORKERS, TS_QUEUE_SIZE, TS_RATE_LIMIT_RPS) override the values below.
+
 server:
   port: 8080
   env: "production"
+  read_timeout: 15s
+  write_timeout: 30s
+  idle_timeout: 120s
+  shutdown_timeout: 20s
+  max_body_bytes: 16777216   # 16 MiB — enough for a 1 MP radiometric frame
+  cors_origins: ["*"]
+
+concurrency:
+  workers: 0                 # 0 = one worker per CPU core
+  queue_size: 1024           # jobs beyond this are rejected with 503 + Retry-After
+  job_timeout: 5s
+  rate_limit_rps: 200        # per client IP; 0 disables rate limiting
+  rate_limit_burst: 400
+
+thermal:
+  emissivity: 0.98           # human skin
+  reflected_temp_c: 22.0
+  skin_min_c: 30.0
+  skin_max_c: 42.0
+  min_subject_pixels: 120
+  max_subjects: 64
+  core_offset_c: 0.3         # inner canthus -> core body offset (site calibrated)
+  elevated_threshold_c: 37.5
+  fever_threshold_c: 38.0
+  indeterminate_below_c: 34.0
+  liveness_min_span_c: 1.5
+  liveness_min_ambient_delta_c: 4.0
+  max_pixels: 1048576
+
+tracking:
+  iou_threshold: 0.25
+  max_age: 15                # frames a lost track is kept alive
+  min_hits: 3                # consecutive hits before a track is confirmed
+  min_score: 0.3
+  max_detections: 512
+  max_sessions: 256
+  session_ttl: 10m
+  process_noise: 1.0
+  measurement_noise: 4.0
 
 model:
   path: "./tensorflow_model/saved_model"
@@ -9,4 +53,3 @@ model:
 analytics:
   enabled: true
   output_dir: "./data/reports"
-
