@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -351,31 +352,50 @@ func call(method, url string, in, out any) error {
 	return json.Unmarshal(b, out)
 }
 
+// raw sends one request. It honours the API's back-pressure signals: on
+// 429 (rate limited) or 503 (overloaded) it waits for Retry-After and retries,
+// so the walkthrough works against a server running the default rate limit.
 func raw(method, url string, in any) ([]byte, error) {
-	var body io.Reader
+	var payload []byte
 	if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
 			return nil, err
 		}
-		body = bytes.NewReader(b)
+		payload = b
 	}
-	req, err := http.NewRequest(method, url, body)
-	if err != nil {
-		return nil, err
+	const maxAttempts = 30
+	for attempt := 1; ; attempt++ {
+		var body io.Reader
+		if payload != nil {
+			body = bytes.NewReader(payload)
+		}
+		req, err := http.NewRequest(method, url, body)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		b, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable
+		if retryable && attempt < maxAttempts {
+			wait := time.Second
+			if secs, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && secs >= 0 {
+				wait = time.Duration(secs) * time.Second
+			}
+			time.Sleep(max(wait, 50*time.Millisecond))
+			continue
+		}
+		if resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("%s %s: %s: %s", method, url, resp.Status, bytes.TrimSpace(b))
+		}
+		return b, nil
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s %s: %s: %s", method, url, resp.Status, bytes.TrimSpace(b))
-	}
-	return b, nil
 }
