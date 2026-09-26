@@ -17,19 +17,23 @@ import (
 	"time"
 
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/config"
+	"github.com/TensorShadow/TensorShadow/go_backend/internal/coreg"
+	"github.com/TensorShadow/TensorShadow/go_backend/internal/inference"
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/metrics"
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/tracking"
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/workerpool"
 )
 
 // Version is the API version reported by /health and /stats.
-const Version = "2.0.0"
+const Version = "2.1.0"
 
 // Server wires configuration, the worker pool and domain services to HTTP.
 type Server struct {
 	cfg     config.Config
 	pool    *workerpool.Pool
 	crowd   *tracking.Manager
+	infer   *inference.Engine
+	coreg   *coreg.Registry
 	metrics *metrics.Registry
 	limiter *rateLimiter
 	log     *slog.Logger
@@ -43,6 +47,8 @@ type Server struct {
 type Deps struct {
 	Pool    *workerpool.Pool
 	Crowd   *tracking.Manager
+	Infer   *inference.Engine // optional; defaults to the in-process baseline
+	Coreg   *coreg.Registry   // optional; defaults to an empty rig registry
 	Metrics *metrics.Registry
 	Logger  *slog.Logger
 	Web     fs.FS // optional; serves index.html at "/"
@@ -56,8 +62,14 @@ func New(cfg config.Config, d Deps) *Server {
 	if d.Metrics == nil {
 		d.Metrics = metrics.New()
 	}
+	if d.Infer == nil {
+		d.Infer, _ = inference.New(inference.DefaultConfig(), nil)
+	}
+	if d.Coreg == nil {
+		d.Coreg, _ = coreg.NewRegistry(nil)
+	}
 	s := &Server{
-		cfg: cfg, pool: d.Pool, crowd: d.Crowd, metrics: d.Metrics, log: d.Logger, web: d.Web,
+		cfg: cfg, pool: d.Pool, crowd: d.Crowd, infer: d.Infer, coreg: d.Coreg, metrics: d.Metrics, log: d.Logger, web: d.Web,
 		limiter: newRateLimiter(cfg.Concurrency.RateLimitRPS, cfg.Concurrency.RateLimitBurst),
 		started: time.Now(),
 	}
@@ -67,10 +79,17 @@ func New(cfg config.Config, d Deps) *Server {
 	s.route(mux, "GET /api/v1/health", false, s.handleHealth)
 	s.route(mux, "GET /api/v1/stats", true, s.handleStats)
 	s.route(mux, "POST /api/v1/predict", true, s.handlePredict)
+	s.route(mux, "GET /api/v1/model", true, s.handleModelInfo)
 
 	s.route(mux, "POST /api/v1/thermal/analyze", true, s.handleThermalAnalyze)
 	s.route(mux, "POST /api/v1/thermal/render", true, s.handleThermalRender)
 	s.route(mux, "GET /api/v1/thermal/palettes", true, s.handlePalettes)
+
+	s.route(mux, "POST /api/v1/coreg/rigs", true, s.handleCreateRig)
+	s.route(mux, "GET /api/v1/coreg/rigs", true, s.handleListRigs)
+	s.route(mux, "GET /api/v1/coreg/rigs/{id}", true, s.handleGetRig)
+	s.route(mux, "DELETE /api/v1/coreg/rigs/{id}", true, s.handleDeleteRig)
+	s.route(mux, "POST /api/v1/coreg/rigs/{id}/map", true, s.handleMapBoxes)
 
 	s.route(mux, "POST /api/v1/crowd/sessions", true, s.handleCreateSession)
 	s.route(mux, "GET /api/v1/crowd/sessions", true, s.handleListSessions)
@@ -122,6 +141,15 @@ func (s *Server) registerGauges() {
 		{Name: "tensorshadow_pool_rejected_total", Help: "Jobs rejected because the queue was full.", Fn: func() float64 { return float64(s.pool.Stats().Rejected) }},
 		{Name: "tensorshadow_crowd_sessions", Help: "Active crowd tracking sessions.", Fn: func() float64 { n, _ := s.crowd.Totals(); return float64(n) }},
 		{Name: "tensorshadow_crowd_active_subjects", Help: "Subjects currently tracked across all sessions.", Fn: func() float64 { _, n := s.crowd.Totals(); return float64(n) }},
+		{Name: "tensorshadow_inference_requests_total", Help: "Prediction requests.", Fn: func() float64 { return float64(s.infer.Stats().Requests) }},
+		{Name: "tensorshadow_inference_backend_failures_total", Help: "Model-server calls that failed after retries.", Fn: func() float64 { return float64(s.infer.Stats().Failures) }},
+		{Name: "tensorshadow_inference_fallbacks_total", Help: "Predictions served by the baseline fallback.", Fn: func() float64 { return float64(s.infer.Stats().Fallbacks) }},
+		{Name: "tensorshadow_inference_breaker_open", Help: "1 while the model-server circuit breaker is open.", Fn: func() float64 {
+			if s.infer.Stats().BreakerOpen {
+				return 1
+			}
+			return 0
+		}},
 		{Name: "tensorshadow_goroutines", Help: "Goroutines.", Fn: func() float64 { return float64(runtime.NumGoroutine()) }},
 	} {
 		s.metrics.RegisterGauge(g)
@@ -147,6 +175,16 @@ type errorBody struct {
 		Message string `json:"message"`
 	} `json:"error"`
 	RequestID string `json:"request_id,omitempty"`
+}
+
+// writeAPIError writes an *apiError (or a generic 400 for other errors).
+func (s *Server) writeAPIError(w http.ResponseWriter, r *http.Request, err error) {
+	var ae *apiError
+	if errors.As(err, &ae) {
+		writeError(w, r, ae.status, ae.code, ae.message)
+		return
+	}
+	writeError(w, r, http.StatusBadRequest, "invalid_request", err.Error())
 }
 
 func writeError(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
@@ -227,12 +265,13 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	runtime.ReadMemStats(&ms)
 	sessions, subjects := s.crowd.Totals()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"service": "TensorShadow-backend",
-		"version": Version,
-		"env":     s.cfg.Server.Env,
-		"http":    s.metrics.Summary(),
-		"pool":    s.pool.Stats(),
-		"crowd":   map[string]int{"sessions": sessions, "active_subjects": subjects},
+		"service":   "TensorShadow-backend",
+		"version":   Version,
+		"env":       s.cfg.Server.Env,
+		"http":      s.metrics.Summary(),
+		"pool":      s.pool.Stats(),
+		"crowd":     map[string]int{"sessions": sessions, "active_subjects": subjects},
+		"inference": map[string]any{"backend": s.infer.Config().Backend, "stats": s.infer.Stats()},
 		"runtime": map[string]any{
 			"go_version":    runtime.Version(),
 			"num_cpu":       runtime.NumCPU(),
@@ -261,42 +300,4 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(b)
-}
-
-// predictRequest keeps the v1 contract of the original stub endpoint.
-type predictRequest struct {
-	Data []float64 `json:"data"`
-}
-
-// handlePredict scores a feature vector with a lightweight baseline logistic
-// model. It is a placeholder for a TensorFlow Serving / ONNX runtime call and
-// exists to keep the v1 API contract stable.
-func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
-	var req predictRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	if len(req.Data) == 0 || len(req.Data) > 4096 {
-		writeError(w, r, http.StatusBadRequest, "invalid_request", "data must contain 1–4096 numbers")
-		return
-	}
-	v, ok := s.exec(w, r, func(context.Context) (any, error) {
-		var sum float64
-		for i, x := range req.Data {
-			if math.IsNaN(x) || math.IsInf(x, 0) {
-				return nil, badRequest("data[%d] is not finite", i)
-			}
-			sum += x
-		}
-		return 1 / (1 + math.Exp(-sum/float64(len(req.Data)))), nil
-	})
-	if !ok {
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":    "success",
-		"result":    math.Round(v.(float64)*1e6) / 1e6,
-		"model":     "baseline-logistic",
-		"timestamp": time.Now().UTC(),
-	})
 }

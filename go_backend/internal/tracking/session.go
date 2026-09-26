@@ -51,6 +51,9 @@ type SessionConfig struct {
 	Zones       []Zone     `json:"zones,omitempty"`
 	HeatmapCols int        `json:"heatmap_cols,omitempty"`
 	HeatmapRows int        `json:"heatmap_rows,omitempty"`
+	// AppearanceThreshold overrides tracking.appearance_threshold for this
+	// session (max cosine distance), e.g. for a noisier embedding model.
+	AppearanceThreshold float64 `json:"appearance_threshold,omitempty"`
 }
 
 func (c *SessionConfig) normalise() error {
@@ -62,6 +65,9 @@ func (c *SessionConfig) normalise() error {
 	}
 	if c.AreaM2 < 0 || math.IsNaN(c.AreaM2) {
 		return errors.New("area_m2 must be >= 0")
+	}
+	if c.AppearanceThreshold < 0 || c.AppearanceThreshold >= 2 || math.IsNaN(c.AppearanceThreshold) {
+		return errors.New("appearance_threshold must be in (0,2)")
 	}
 	if c.HeatmapCols == 0 {
 		c.HeatmapCols = 32
@@ -124,6 +130,7 @@ type TrackOut struct {
 	DwellSeconds float64    `json:"dwell_seconds"`
 	Score        float64    `json:"score"`
 	Label        string     `json:"label,omitempty"`
+	Reidentified int        `json:"reidentified,omitempty"` // recoveries by appearance after long occlusion
 }
 
 // LineCount is the running tally for one tripwire.
@@ -166,6 +173,15 @@ type Flow struct {
 }
 
 // Dwell summarises time spent in view.
+// ReID summarises appearance re-identification for the session.
+type ReID struct {
+	Enabled      bool    `json:"enabled"` // detections carry embeddings
+	EmbeddingDim int     `json:"embedding_dim,omitempty"`
+	Threshold    float64 `json:"appearance_threshold"`
+	Recoveries   uint64  `json:"recoveries"` // IDs kept across gaps longer than max_age
+}
+
+// Dwell summarises time spent in view.
 type Dwell struct {
 	ActiveAvgSeconds    float64 `json:"active_avg_seconds"`
 	ActiveMaxSeconds    float64 `json:"active_max_seconds"`
@@ -183,6 +199,7 @@ type Analytics struct {
 	Density         Density     `json:"density"`
 	Flow            Flow        `json:"flow"`
 	Dwell           Dwell       `json:"dwell"`
+	ReID            ReID        `json:"reid"`
 	Lines           []LineCount `json:"lines"`
 	Zones           []ZoneCount `json:"zones"`
 }
@@ -232,6 +249,8 @@ type Session struct {
 	dwellN    uint64
 	last      Analytics
 	lastCount int
+	embedDim  int
+	reidCount uint64
 
 	subMu sync.Mutex
 	subs  map[chan []byte]struct{}
@@ -272,6 +291,13 @@ func (s *Session) Process(in FrameInput, now time.Time) (FrameResult, error) {
 		if d.Score < s.trackCfg.MinScore {
 			continue
 		}
+		if d.Embedding != nil {
+			f, err := normalise(d.Embedding)
+			if err != nil {
+				return FrameResult{}, fmt.Errorf("detections[%d].embedding: %w", i, err)
+			}
+			d.Embedding = f
+		}
 		dets = append(dets, d)
 	}
 	ts := now
@@ -281,10 +307,22 @@ func (s *Session) Process(in FrameInput, now time.Time) (FrameResult, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for i, d := range dets {
+		if d.Embedding == nil {
+			continue
+		}
+		if s.embedDim == 0 {
+			s.embedDim = len(d.Embedding)
+		} else if len(d.Embedding) != s.embedDim {
+			return FrameResult{}, fmt.Errorf("detections[%d].embedding has %d dims; this session uses %d", i, len(d.Embedding), s.embedDim)
+		}
+	}
 	s.lastUsed = now
 	s.frames++
 
-	for _, t := range s.tracker.step(dets, ts) {
+	step := s.tracker.step(dets, ts, s.appearanceThreshold())
+	s.reidCount += uint64(step.recoveries)
+	for _, t := range step.removed {
 		s.dwellSum += t.lastSeen.Sub(t.firstSeen).Seconds()
 		s.dwellN++
 		for zi := range s.zones {
@@ -331,7 +369,7 @@ func trackOut(t *track, ts time.Time) TrackOut {
 	return TrackOut{
 		ID: t.id, State: t.state(), BBox: roundBox(t.box()), Center: roundPoint(t.center()),
 		Velocity:  roundPoint(Point{t.kf[0].v, t.kf[1].v}),
-		AgeFrames: t.age + 1, Hits: t.hits,
+		AgeFrames: t.age + 1, Hits: t.hits, Reidentified: t.reidentified,
 		DwellSeconds: round3(ts.Sub(t.firstSeen).Seconds()),
 		Score:        round3(t.score), Label: t.label,
 	}
@@ -387,8 +425,10 @@ func (s *Session) analyticsLocked(present []*track, ts time.Time) Analytics {
 		UniqueSubjects:  s.tracker.UniqueSubjects(),
 		PeakSubjects:    s.peak,
 		FramesProcessed: s.frames,
-		Lines:           make([]LineCount, len(s.cfg.Lines)),
-		Zones:           make([]ZoneCount, len(s.cfg.Zones)),
+		ReID: ReID{Enabled: s.embedDim > 0, EmbeddingDim: s.embedDim,
+			Threshold: s.appearanceThreshold(), Recoveries: s.reidCount},
+		Lines: make([]LineCount, len(s.cfg.Lines)),
+		Zones: make([]ZoneCount, len(s.cfg.Zones)),
 	}
 	if s.peak > 0 {
 		p := s.peakAt
@@ -610,3 +650,33 @@ func round3(v float64) float64 { return math.Round(v*1000) / 1000 }
 func roundPoint(p Point) Point { return Point{round3(p.X), round3(p.Y)} }
 
 func roundBox(b BBox) BBox { return BBox{round3(b.X), round3(b.Y), round3(b.W), round3(b.H)} }
+
+func (s *Session) appearanceThreshold() float64 {
+	if s.cfg.AppearanceThreshold > 0 {
+		return s.cfg.AppearanceThreshold
+	}
+	return s.trackCfg.AppearanceThreshold
+}
+
+// normalise validates an embedding and returns an L2-normalised copy.
+func normalise(v []float64) ([]float64, error) {
+	if len(v) == 0 || len(v) > MaxEmbeddingDim {
+		return nil, fmt.Errorf("must have 1–%d values", MaxEmbeddingDim)
+	}
+	var n float64
+	for _, x := range v {
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return nil, errors.New("values must be finite")
+		}
+		n += x * x
+	}
+	if n == 0 {
+		return nil, errors.New("must not be the zero vector")
+	}
+	n = math.Sqrt(n)
+	out := make([]float64, len(v))
+	for i, x := range v {
+		out[i] = x / n
+	}
+	return out, nil
+}

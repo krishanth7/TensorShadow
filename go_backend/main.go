@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/config"
+	"github.com/TensorShadow/TensorShadow/go_backend/internal/coreg"
+	"github.com/TensorShadow/TensorShadow/go_backend/internal/inference"
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/metrics"
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/server"
 	"github.com/TensorShadow/TensorShadow/go_backend/internal/tracking"
@@ -48,8 +50,16 @@ func run() error {
 
 	pool := workerpool.New(cfg.Concurrency.Workers, cfg.Concurrency.QueueSize)
 	crowd := tracking.NewManager(cfg.Tracking)
+	infer, err := inference.New(cfg.Inference, nil)
+	if err != nil {
+		return err
+	}
+	rigs, err := coreg.NewRegistry(cfg.Coreg.Rigs)
+	if err != nil {
+		return err
+	}
 	srv := server.New(cfg, server.Deps{
-		Pool: pool, Crowd: crowd, Metrics: metrics.New(), Logger: log, Web: web.FS,
+		Pool: pool, Crowd: crowd, Infer: infer, Coreg: rigs, Metrics: metrics.New(), Logger: log, Web: web.FS,
 	})
 
 	listen := ":" + cfg.Server.Port
@@ -79,7 +89,12 @@ func run() error {
 	ps := pool.Stats()
 	log.Info("TensorShadow backend listening",
 		"addr", ln.Addr().String(), "version", server.Version, "env", cfg.Server.Env, "config", used,
-		"workers", ps.Workers, "queue", ps.QueueCapacity)
+		"workers", ps.Workers, "queue", ps.QueueCapacity,
+		"model_backend", cfg.Inference.Backend, "model_url", cfg.Inference.URL)
+	if cfg.Inference.Backend != inference.BackendBaseline {
+		st := infer.Info(ctx).Status
+		log.Info("model backend status", "ready", st.Ready, "state", st.State, "detail", st.Detail)
+	}
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpSrv.Serve(ln) }()

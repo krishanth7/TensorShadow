@@ -32,6 +32,39 @@ jobs:
           ./bin/tsdemo -out /tmp/demo
           python3 clients/python/tensorshadow_client.py
 
+  model-serving:
+    name: Live model servers (TF Serving + ONNX Runtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Start TensorFlow Serving
+        run: |
+          docker run -d -p 8501:8501 \
+            -v "$PWD/tensorflow_model/serving/tensorshadow:/models/tensorshadow" \
+            -e MODEL_NAME=tensorshadow tensorflow/serving
+      - name: Start ONNX Runtime server
+        run: |
+          pip install onnxruntime numpy
+          python tensorflow_model/onnx_server.py --port 8001 &
+      - name: Wait for both servers
+        run: |
+          for i in $(seq 60); do
+            curl -fsS localhost:8501/v1/models/tensorshadow && curl -fsS localhost:8001/v2/models/tensorshadow/ready && exit 0
+            sleep 2
+          done
+          exit 1
+      - name: Go → model server parity test
+        run: go test -count=1 -run TestLiveModelServers -v ./go_backend/internal/inference/
+        env:
+          TS_TFSERVING_URL: http://localhost:8501
+          TS_ONNX_URL: http://localhost:8001
+
   python:
     name: Repository smoke test
     runs-on: ubuntu-latest

@@ -276,3 +276,65 @@ func TestHeatmapAndSubscribe(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestEmbeddingValidation(t *testing.T) {
+	m := NewManager(DefaultConfig())
+	s, _ := m.Create(SessionConfig{FrameWidth: 100, FrameHeight: 100})
+	withEmb := func(e []float64) FrameInput {
+		return FrameInput{Detections: []Detection{{BBox: BBox{0, 0, 10, 10}, Score: 0.9, Embedding: e}}}
+	}
+	if _, err := s.Process(withEmb([]float64{0, 0, 0}), time.Now()); err == nil {
+		t.Fatal("zero embedding accepted")
+	}
+	if _, err := s.Process(withEmb([]float64{1, math.Inf(1)}), time.Now()); err == nil {
+		t.Fatal("non-finite embedding accepted")
+	}
+	res, err := s.Process(withEmb([]float64{3, 4}), time.Now())
+	if err != nil || !res.Analytics.ReID.Enabled || res.Analytics.ReID.EmbeddingDim != 2 {
+		t.Fatalf("valid embedding: %v %+v", err, res.Analytics.ReID)
+	}
+	if _, err := s.Process(withEmb([]float64{1, 2, 3}), time.Now()); err == nil {
+		t.Fatal("dimension change accepted")
+	}
+	if _, err := m.Create(SessionConfig{FrameWidth: 1, FrameHeight: 1, AppearanceThreshold: 3}); err == nil {
+		t.Fatal("bad appearance_threshold accepted")
+	}
+}
+
+// TestAppearanceResolvesSwap: two people vanish together and reappear with
+// swapped positions. IoU/motion alone would swap their IDs; appearance keeps
+// each identity with the right person.
+func TestAppearanceResolvesSwap(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MinHits = 1
+	m := NewManager(cfg)
+	s, _ := m.Create(SessionConfig{FrameWidth: 1000, FrameHeight: 1000})
+	a, b := []float64{1, 0, 0, 0}, []float64{0, 1, 0, 0}
+	det := func(x float64, e []float64) Detection {
+		return Detection{BBox: BBox{x, 400, 80, 200}, Score: 0.9, Embedding: e}
+	}
+	now := time.Now()
+	var res FrameResult
+	for i := 0; i < 5; i++ { // A stands at x=300, B at x=420, both still
+		res, _ = s.Process(FrameInput{Detections: []Detection{det(300, a), det(420, b)}}, now)
+	}
+	idAt := func(r FrameResult, x float64) uint64 {
+		for _, tr := range r.Tracks {
+			if math.Abs(tr.BBox.X-x) < 20 {
+				return tr.ID
+			}
+		}
+		return 0
+	}
+	idA, idB := idAt(res, 300), idAt(res, 420)
+	for i := 0; i < 30; i++ { // both hidden for longer than max_age
+		s.Process(FrameInput{}, now)
+	}
+	res, _ = s.Process(FrameInput{Detections: []Detection{det(300, b), det(420, a)}}, now)
+	if idAt(res, 420) != idA || idAt(res, 300) != idB {
+		t.Fatalf("identities not preserved across swap: A=%d B=%d, got at300=%d at420=%d", idA, idB, idAt(res, 300), idAt(res, 420))
+	}
+	if res.Analytics.ReID.Recoveries != 2 {
+		t.Fatalf("recoveries = %d, want 2", res.Analytics.ReID.Recoveries)
+	}
+}

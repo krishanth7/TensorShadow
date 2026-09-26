@@ -14,13 +14,19 @@ import (
 
 type thermalResponse struct {
 	thermal.Result
-	ProcessingMs float64 `json:"processing_ms"`
-	RequestID    string  `json:"request_id"`
+	Coregistration *coregInfo `json:"coregistration,omitempty"`
+	ProcessingMs   float64    `json:"processing_ms"`
+	RequestID      string     `json:"request_id"`
 }
 
 func (s *Server) handleThermalAnalyze(w http.ResponseWriter, r *http.Request) {
 	req, ok := s.readFrame(w, r)
 	if !ok {
+		return
+	}
+	coregRes, err := s.applyRig(&req)
+	if err != nil {
+		s.writeAPIError(w, r, err)
 		return
 	}
 	cfg := s.cfg.Thermal
@@ -31,7 +37,9 @@ func (s *Server) handleThermalAnalyze(w http.ResponseWriter, r *http.Request) {
 			return nil, badRequest("%v", err)
 		}
 		res := thermal.Analyze(f, req.ROIs, cfg)
-		return thermalResponse{Result: res, ProcessingMs: float64(time.Since(start).Microseconds()) / 1000}, nil
+		attachVisible(&res, &req)
+		return thermalResponse{Result: res, Coregistration: coregRes,
+			ProcessingMs: float64(time.Since(start).Microseconds()) / 1000}, nil
 	})
 	if !ok {
 		return
@@ -73,6 +81,10 @@ func (s *Server) handleThermalRender(w http.ResponseWriter, r *http.Request) {
 
 	req, ok := s.readFrame(w, r)
 	if !ok {
+		return
+	}
+	if _, err := s.applyRig(&req); err != nil {
+		s.writeAPIError(w, r, err)
 		return
 	}
 	cfg := s.cfg.Thermal

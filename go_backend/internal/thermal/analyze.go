@@ -54,13 +54,19 @@ type Liveness struct {
 
 // Subject is the analysis of one thermal face.
 type Subject struct {
-	Index        int       `json:"index"`
-	ROI          Rect      `json:"roi"`
-	Skin         SkinStats `json:"skin"`
-	Canthus      Hotspot   `json:"canthus"`
-	CoreEstimate float64   `json:"core_estimate_c"`
-	Status       string    `json:"status"`
-	Liveness     Liveness  `json:"liveness"`
+	Index int `json:"index"`
+	// ROIIndex is the position of the caller-supplied ROI (or visible box)
+	// this subject was measured in; nil for automatically segmented subjects.
+	ROIIndex *int `json:"roi_index,omitempty"`
+	// VisibleROI echoes the RGB detector box (and its ID) that drove this
+	// ROI through a co-registration rig.
+	VisibleROI   *VisibleBox `json:"visible_roi,omitempty"`
+	ROI          Rect        `json:"roi"`
+	Skin         SkinStats   `json:"skin"`
+	Canthus      Hotspot     `json:"canthus"`
+	CoreEstimate float64     `json:"core_estimate_c"`
+	Status       string      `json:"status"`
+	Liveness     Liveness    `json:"liveness"`
 }
 
 // FrameSummary describes the whole frame.
@@ -101,6 +107,10 @@ func Analyze(f *Frame, rois []Rect, cfg Config) Result {
 		}
 		s := analyseRegion(f, r, cfg, res.Frame.AmbientC)
 		s.Index = i
+		if r.roiIndex >= 0 {
+			idx := r.roiIndex
+			s.ROIIndex = &idx
+		}
 		res.Subjects = append(res.Subjects, s)
 		res.Summary[s.Status]++
 		if s.Liveness.Live {
@@ -146,11 +156,12 @@ func summarise(f *Frame, cfg Config) FrameSummary {
 // Segmented regions share one label image (labels[i] == id); caller-supplied
 // ROIs may overlap, so each carries its own membership mask.
 type region struct {
-	box    Rect
-	labels []int32
-	id     int32
-	member []bool
-	pixels []int
+	roiIndex int // index into caller ROIs, -1 when segmented
+	box      Rect
+	labels   []int32
+	id       int32
+	member   []bool
+	pixels   []int
 }
 
 func (r *region) contains(i int) bool {
@@ -195,8 +206,9 @@ func segment(f *Frame, cfg Config) []region {
 			continue
 		}
 		regions = append(regions, region{
-			box:    Rect{X: minX, Y: minY, W: maxX - minX + 1, H: maxY - minY + 1},
-			labels: label, id: next, pixels: pixels,
+			roiIndex: -1,
+			box:      Rect{X: minX, Y: minY, W: maxX - minX + 1, H: maxY - minY + 1},
+			labels:   label, id: next, pixels: pixels,
 		})
 	}
 	// Largest subjects first, then left-to-right for a stable order.
@@ -215,7 +227,7 @@ func segment(f *Frame, cfg Config) []region {
 
 func roiRegions(f *Frame, rois []Rect, cfg Config) []region {
 	var out []region
-	for _, r := range rois {
+	for idx, r := range rois {
 		x0, y0 := max(r.X, 0), max(r.Y, 0)
 		x1, y1 := min(r.X+r.W, f.Width), min(r.Y+r.H, f.Height)
 		if x1 <= x0 || y1 <= y0 {
@@ -232,7 +244,7 @@ func roiRegions(f *Frame, rois []Rect, cfg Config) []region {
 				}
 			}
 		}
-		out = append(out, region{box: Rect{X: x0, Y: y0, W: x1 - x0, H: y1 - y0}, member: member, pixels: pixels})
+		out = append(out, region{roiIndex: idx, box: Rect{X: x0, Y: y0, W: x1 - x0, H: y1 - y0}, member: member, pixels: pixels})
 	}
 	return out
 }
